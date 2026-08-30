@@ -16,6 +16,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <iomanip>
 #include <map>
 #include <cinttypes>
@@ -1394,12 +1395,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
 
+    // PoC: fixed-interval window mapping the recent tg/s to a draft n_max
+    int64_t n_tokens_cum = 0;
+    int64_t t_window_start_us = 0;
+    int64_t n_tokens_window_start = 0;
+    int32_t n_max_base = -1; // configured n_max, restored when the rate is above all map thresholds
+    int32_t n_max_cur = -1;  // last mapped n_max, reused until the window elapses
+    int64_t t_last_accept_us = 0;
+    int64_t n_max_map_window_us = 0; // evaluation interval, from params.n_max_map_window_s
+    int64_t n_max_map_idle_us = 0;   // accept gap that resets the window, from params.n_max_map_idle_s
+
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
+        , n_max_map_window_us((int64_t) params.draft.n_max_map_window_s * 1000 * 1000)
+        , n_max_map_idle_us((int64_t) params.draft.n_max_map_idle_s * 1000 * 1000)
     {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
@@ -1412,6 +1425,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
+        if (!this->params.n_max_map.empty()) {
+            std::string s_map;
+            for (const auto & mv : this->params.n_max_map) {
+                s_map += string_format("%g:%d ", mv.first, mv.second);
+            }
+            SPC_INF("- n_max_map={%s}\n", s_map.c_str());
+        }
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
                 ggml_type_name(this->params.cache_type_k),
@@ -1466,6 +1486,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
         this->n_max = this->params.n_max;
+
+        n_max_base = this->params.n_max;
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
@@ -1634,6 +1656,60 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        // PoC: map the recent tg/s to a draft n_max
+        if (!params.n_max_map.empty()) {
+            const int32_t n_max_dyn = n_max_mapped();
+            if (n_max_dyn > 0) {
+                params.n_max = n_max_dyn;
+            }
+        }
+        draft_original(dparams);
+    }
+
+    int32_t n_max_mapped() {
+        const int64_t t_now = ggml_time_us();
+        if (t_window_start_us == 0) {
+            t_window_start_us = t_now;
+            n_tokens_window_start = n_tokens_cum;
+            return n_max_cur;
+        }
+        if (t_now - t_window_start_us < n_max_map_window_us) {
+            return n_max_cur;
+        }
+
+        const int64_t n_tokens = n_tokens_cum - n_tokens_window_start;
+        const double t_sec = (double) (t_now - t_window_start_us) / 1e6;
+        const float rate = (float) n_tokens / (float) t_sec;
+
+        int32_t n_max = n_max_base; // rate above all thresholds
+        float threshold = 0.0f;
+        for (const auto & mv : params.n_max_map) { // sorted by threshold desc
+            if (rate >= mv.first) {
+                break;
+            }
+            // keep going: the lowest threshold still above the rate wins
+            n_max = mv.second;
+            threshold = mv.first;
+        }
+        if (chain_heads) {
+            n_max = std::min(n_max, n_mtp_layers);
+        }
+
+        if (threshold > 0.0f) {
+            SPC_INF("n_max_map: rate=%.2f tok/s (window %.1fs) < threshold %.1f, n_max %d -> %d\n",
+                    (double) rate, t_sec, (double) threshold, params.n_max, n_max);
+        } else {
+            SPC_INF("n_max_map: rate=%.2f tok/s (window %.1fs) above all thresholds, n_max %d -> %d\n",
+                    (double) rate, t_sec, params.n_max, n_max);
+        }
+
+        n_max_cur = n_max;
+        t_window_start_us = t_now;
+        n_tokens_window_start = n_tokens_cum;
+        return n_max;
+    }
+
+    void draft_original(common_speculative_draft_params_vec & dparams) {
         auto & ctx_dft = params.ctx_dft;
 
         common_batch_clear(batch);
@@ -1784,9 +1860,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
+        }
+
+        // one step produces n_accepted + 1 tokens (accepted drafts + bonus)
+        if (!is_other && !params.n_max_map.empty()) {
+            const int64_t t_now = ggml_time_us();
+            // a large gap means downtime (idle, prompt processing, ...); the window rate
+            // would be diluted by it, so restart the window and revert to the default n_max
+            if (t_last_accept_us > 0 && t_now - t_last_accept_us > n_max_map_idle_us) {
+                SPC_INF("n_max_map: gap %.1fs since last accept, resetting window, n_max -> default\n",
+                        (double) (t_now - t_last_accept_us) / 1e6);
+                t_window_start_us = t_now;
+                n_tokens_window_start = n_tokens_cum;
+                n_max_cur = -1;
+            }
+            t_last_accept_us = t_now;
+            n_tokens_cum += n_accepted + 1;
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];
@@ -2373,11 +2465,18 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
         switch (type) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
             case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
-            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
                 break;
+            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
+                int32_t n = std::max(0, spec->draft.n_max);
+                for (const auto & mv : spec->draft.n_max_map) {
+                    n = std::max(n, mv.second);
+                }
+                n_max = std::max(n_max, n);
+                break;
+            }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
                 n_max = std::max(n_max, (int32_t) spec->ngram_simple.size_m);
                 break;

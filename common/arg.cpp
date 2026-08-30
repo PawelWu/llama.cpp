@@ -4147,6 +4147,86 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
+        {"--spec-draft-n-max-map"}, "JSON",
+        "map of tg/s threshold to n_max for dynamic draft length, e.g. {5:4, 3:5} (MTP only)",
+        [](common_params & params, const std::string & value) {
+            auto trim = [](std::string s) {
+                s.erase(0, s.find_first_not_of(" \t\r\n"));
+                s.erase(s.find_last_not_of(" \t\r\n") + 1);
+                return s;
+            };
+
+            std::string s = trim(value);
+            if (s.size() < 2 || s.front() != '{' || s.back() != '}') {
+                throw std::invalid_argument("expected a map like {5:4, 3:5}");
+            }
+            s = trim(s.substr(1, s.size() - 2));
+
+            auto & n_max_map = params.speculative.draft.n_max_map;
+            std::string rest = s;
+            while (true) {
+                std::string item = rest;
+                const auto pos = rest.find(',');
+                if (pos != std::string::npos) {
+                    item = rest.substr(0, pos);
+                    rest = rest.substr(pos + 1);
+                } else {
+                    rest.clear();
+                }
+                item = trim(item);
+                if (item.empty()) {
+                    continue;
+                }
+                const auto pos_colon = item.find(':');
+                if (pos_colon == std::string::npos) {
+                    throw std::invalid_argument(string_format("invalid map entry '%s', expected threshold:n_max", item.c_str()));
+                }
+                const std::string s_key = trim(item.substr(0, pos_colon));
+                const std::string s_val = trim(item.substr(pos_colon + 1));
+                size_t pos_end = 0;
+                const float threshold = std::stof(s_key, &pos_end);
+                if (pos_end != s_key.size() || threshold <= 0.0f) {
+                    throw std::invalid_argument(string_format("invalid threshold '%s', must be a number > 0", s_key.c_str()));
+                }
+                const int32_t n_max = std::stoi(s_val, &pos_end);
+                if (pos_end != s_val.size() || n_max < 0) {
+                    throw std::invalid_argument(string_format("invalid n_max '%s', must be an integer >= 0", s_val.c_str()));
+                }
+                n_max_map.emplace_back(threshold, n_max);
+                if (rest.empty()) {
+                    break;
+                }
+            }
+
+            if (n_max_map.empty()) {
+                throw std::invalid_argument("empty map");
+            }
+            std::sort(n_max_map.begin(), n_max_map.end(), [](const auto & a, const auto & b) {
+                return a.first > b.first;
+            });
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX_MAP"));
+    add_opt(common_arg(
+        {"--spec-draft-n-max-map-window"}, "S",
+        string_format("interval (s) between re-evaluations of --spec-draft-n-max-map (default: %d)", params.speculative.draft.n_max_map_window_s),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_max_map_window_s = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX_MAP_WINDOW"));
+    add_opt(common_arg(
+        {"--spec-draft-n-max-map-idle"}, "S",
+        string_format("gap (s) between accepts that resets the --spec-draft-n-max-map window (default: %d)", params.speculative.draft.n_max_map_idle_s),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_max_map_idle_s = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX_MAP_IDLE"));
+    add_opt(common_arg(
         {"--spec-draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
         [](common_params & params, int value) {

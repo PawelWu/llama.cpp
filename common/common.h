@@ -326,6 +326,12 @@ struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
+    // (tg/s threshold, n_max) pairs, sorted by threshold desc;
+    // when the recent generation rate drops below a threshold, the related n_max is used (MTP only, PoC)
+    std::vector<std::pair<float, int32_t>> n_max_map;
+    int32_t n_max_map_window_s = 30; // interval (s) between n_max_map re-evaluations
+    int32_t n_max_map_idle_s   = 2;  // gap (s) between accepts that resets the n_max_map window (downtime)
+
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
@@ -395,8 +401,15 @@ struct common_params_speculative {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
+        if (!needs_rs_seq) {
+            return 0u;
+        }
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        uint32_t n = (uint32_t) std::max(0, draft.n_max);
+        for (const auto & mv : draft.n_max_map) {
+            n = std::max(n, (uint32_t) mv.second);
+        }
+        return n;
     }
 };
 
