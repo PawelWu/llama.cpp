@@ -1424,6 +1424,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (load_mode = %s)\n",
         __func__, load_mode_name);
+    fprintf(stderr, "[DEBUG] load_tensors START: n_layer_all=%d, devices.size()=%zu, n_gpu_layers=%d\n",
+            n_layer_all, devices.size(), n_gpu_layers);
 
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
@@ -1468,19 +1470,30 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         split_sum += splits[i];
         splits[i] = split_sum;
     }
-    for (size_t i = 0; i < n_devices(); ++i) {
-        splits[i] /= split_sum;
+    if (split_sum == 0.0f) {
+        // all devices reported 0 free memory, fall back to equal splits
+        for (size_t i = 0; i < n_devices(); ++i) {
+            splits[i] = float(i + 1) / float(n_devices());
+        }
+    } else {
+        for (size_t i = 0; i < n_devices(); ++i) {
+            splits[i] /= split_sum;
+        }
     }
 
     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
+    fprintf(stderr, "[DEBUG] splits: n_devices=%zu, splits[0]=%f, i_gpu_start=%d, act_gpu_layers=%d\n",
+            n_devices(), n_devices() > 0 ? splits[0] : -1.0f, i_gpu_start, act_gpu_layers);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
-        const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
+        const float val = float(il - i_gpu_start)/act_gpu_layers;
+        const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), val) - splits.begin();
+        fprintf(stderr, "[DEBUG] get_layer_buft_list: il=%d, val=%f, layer_gpu=%d, n_devices=%zu\n", il, val, layer_gpu, n_devices());
         auto * dev = devices.at(layer_gpu).dev;
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
         return {dev, &pimpl->gpu_buft_list.at(dev)};
@@ -1491,13 +1504,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
 
     // assign the repeating layers to the devices according to the splits
+    fprintf(stderr, "[DEBUG] before dev_layer.resize: n_layer_all=%d\n", n_layer_all);
     pimpl->dev_layer.resize(n_layer_all);
+    fprintf(stderr, "[DEBUG] after dev_layer.resize: size=%zu\n", pimpl->dev_layer.size());
     for (int il = 0; il < n_layer_all; ++il) {
         pimpl->dev_layer[il] = get_layer_buft_list(il);
     }
+    fprintf(stderr, "[DEBUG] after dev_layer fill loop\n");
 
     // assign the output layer
+    fprintf(stderr, "[DEBUG] before dev_output = get_layer_buft_list(%d)\n", n_layer_all);
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
+    fprintf(stderr, "[DEBUG] after dev_output assignment\n");
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
@@ -1515,7 +1533,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         layers.resize(n_layer_all);
 
         // call the per-model loading function
+        fprintf(stderr, "[DEBUG] load_tensors: n_layer_all=%d, devices.size()=%zu, n_gpu_layers=%d, dev_layer.size()=%zu\n",
+                n_layer_all, devices.size(), params.n_gpu_layers, pimpl->dev_layer.size());
         load_arch_tensors(ml);
+        fprintf(stderr, "[DEBUG] load_tensors: load_arch_tensors completed OK\n");
 
         // generic pass: load optional per-tensor/per-expert ".scale" tensors (e.g. NVFP4 scale2)
         // this avoids having to add scale loading to every architecture
@@ -1837,6 +1858,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+    if (tn.bid >= (int)pimpl->dev_layer.size()) {
+        fprintf(stderr, "[DEBUG] create_tensor: OUT OF RANGE bid=%d, dev_layer.size()=%zu, tensor=%s\n", tn.bid, pimpl->dev_layer.size(), tn.str().c_str());
+    }
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,

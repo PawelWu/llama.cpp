@@ -882,6 +882,8 @@ private:
     common_init_result_ptr llama_init;
 
     llama_context * ctx_tgt = nullptr;
+    llama_context * ctx_pp  = nullptr; // PP prefill context (null if PP disabled)
+    bool pp_pending_sample = false;    // true when PP context has logits waiting for sampling
 
     server_batch batch;
 
@@ -1100,6 +1102,7 @@ private:
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
+        ctx_pp    = llama_init->pp_context();
 
         if (model_tgt == nullptr) {
             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
@@ -3659,11 +3662,37 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        // PP split: route prompt batches to the PP context, decode to main
+        // heuristic: >1 token = prompt, 1 token = decode
+        const bool use_pp = (ctx_pp != nullptr) && (batch_view.n_tokens > 1);
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
-            ret = llama_decode(ctx_tgt, batch_view);
+            if (use_pp) {
+                // Step 1: sync existing KV from main (decode device) to PP (prefill device)
+                const llama_seq_id pp_seq = batch_view.seq_id[0][0];
+                const llama_pos pmax = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), pp_seq);
+                const uint32_t n_existing = (pmax >= 0) ? (uint32_t)(pmax + 1) : 0;
+                if (n_existing > 0) {
+                    LOG_DBG("[PP] syncing %u existing KV cells main -> PP\n", n_existing);
+                    llama_kv_cache_copy_from(ctx_pp, ctx_tgt, n_existing);
+                }
+
+                // Step 2: prefill on PP context
+                ret = llama_decode(ctx_pp, batch_view);
+                if (ret == 0) {
+                    // Step 3: sync updated KV from PP back to main
+                    const uint32_t n_total = n_existing + (uint32_t) batch_view.n_tokens;
+                    LOG_DBG("[PP] prefill %d tokens done, syncing %u KV cells PP -> main\n", batch_view.n_tokens, n_total);
+                    llama_kv_cache_copy_from(ctx_tgt, ctx_pp, n_total);
+                    // do NOT clear PP - post_decode will sample from it
+                    pp_pending_sample = true;
+                }
+            } else {
+                ret = llama_decode(ctx_tgt, batch_view);
+            }
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
@@ -3837,7 +3866,14 @@ private:
             llama_token id;
             {
                 scoped_timer timer(t_sampl, n_sampl);
-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                // When PP is active, sample from the PP context (which has the logits)
+                llama_context * ctx_sample = pp_pending_sample ? ctx_pp : slot.ctx_tgt;
+                id = common_sampler_sample(slot.smpl.get(), ctx_sample, tok_idx);
+                if (pp_pending_sample) {
+                    LOG_DBG("[PP] sampled from PP ctx, keeping PP KV for next round\n");
+                    pp_pending_sample = false;
+                    // do NOT clear PP context - it will be re-synced next round
+                }
             }
 
             slot.i_batch = -1;

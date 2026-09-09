@@ -1241,6 +1241,75 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     return layers[ikv].k;
 }
 
+void llama_kv_cache::copy_from(const llama_kv_cache & src, uint32_t n_cells) {
+    GGML_ASSERT(layers.size() == src.layers.size());
+
+    // cap at destination size (e.g. SWA cache is smaller than full context)
+    const uint32_t dst_size = get_size();
+    if (n_cells > dst_size) {
+        LLAMA_LOG_DEBUG("%s: capping n_cells %u -> %u (dst size)\n", __func__, n_cells, dst_size);
+        n_cells = dst_size;
+    }
+    GGML_ASSERT(src.get_size() >= n_cells);
+
+    LLAMA_LOG_DEBUG("%s: copying %u cells from src to dst\n", __func__, n_cells);
+
+    // create a temporary context for the views (2 view tensors per layer)
+    ggml_init_params params = { (size_t) layers.size() * 2 * 1024, nullptr, false };
+    auto ctx = ggml_init(params);
+
+    for (size_t i = 0; i < layers.size(); ++i) {
+        const auto & src_layer = src.layers[i];
+        auto & dst_layer = layers[i];
+
+        // skip layers with no tensors (e.g. SWA cache not yet allocated)
+        if (!src_layer.k || !dst_layer.k || !src_layer.v || !dst_layer.v) {
+            continue;
+        }
+
+        // copy K
+        {
+            const auto & sk = src_layer.k;
+            auto & dk = dst_layer.k;
+
+            // view over the first n_cells cells of stream 0
+            ggml_tensor * sk_view = ggml_view_3d(ctx, sk, sk->ne[0], n_cells, 1, sk->nb[1], sk->nb[2], 0);
+            ggml_tensor * dk_view = ggml_view_3d(ctx, dk, dk->ne[0], n_cells, 1, dk->nb[1], dk->nb[2], 0);
+
+            // set buffer pointers (views have buffer = NULL by default)
+            sk_view->buffer = sk->buffer;
+            dk_view->buffer = dk->buffer;
+
+            ggml_backend_tensor_copy(sk_view, dk_view);
+        }
+
+        // copy V
+        {
+            const auto & sv = src_layer.v;
+            auto & dv = dst_layer.v;
+
+            // view over the first n_cells cells of stream 0
+            ggml_tensor * sv_view = ggml_view_3d(ctx, sv, sv->ne[0], n_cells, 1, sv->nb[1], sv->nb[2], 0);
+            ggml_tensor * dv_view = ggml_view_3d(ctx, dv, dv->ne[0], n_cells, 1, dv->nb[1], dv->nb[2], 0);
+
+            sv_view->buffer = sv->buffer;
+            dv_view->buffer = dv->buffer;
+
+            ggml_backend_tensor_copy(sv_view, dv_view);
+        }
+    }
+
+    ggml_free(ctx);
+
+    // reset destination metadata, then copy from source (clears stale cells)
+    v_cells[0].reset();
+    auto copied = src.v_cells[0].cp(0, n_cells);
+    v_cells[0].set(0, copied);
+    v_heads[0] = n_cells;
+
+    LLAMA_LOG_DEBUG("%s: done, dst v_heads[0] = %u\n", __func__, v_heads[0]);
+}
+
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 

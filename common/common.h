@@ -485,6 +485,11 @@ struct common_params {
 
     enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
 
+    // prefill/decode split params
+    std::string pp_dev;  // device name for prefill (e.g. "CUDA0"), empty = disabled
+    std::string dec_dev; // device name for decode  (e.g. "Vulkan1"), empty = disabled
+    int32_t     pp_ngl  = -1; // number of layers to offload to the PP device, -1 = all
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 
@@ -932,6 +937,9 @@ struct common_init_result {
 
     llama_model * model();
     llama_context * context();
+
+    llama_model * pp_model();
+    llama_context * pp_context();
 
     common_sampler * sampler(llama_seq_id seq_id);
     void reset_samplers();

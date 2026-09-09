@@ -166,6 +166,11 @@ public:
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
 
+    // copy the first n_cells cells of stream 0 from another cache
+    // used for prefill/decode split: transfer the KV state from the prefill device to the decode device
+    // the source and destination caches must have the same model and the same n_ctx
+    void copy_from(const llama_kv_cache & src, uint32_t n_cells);
+
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
     // state_read, plus the cells the restored tokens were placed in

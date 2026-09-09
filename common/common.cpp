@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 
 #include "build-info.h"
@@ -1281,6 +1282,10 @@ struct common_init_result::impl {
     llama_model_ptr   model;
     llama_context_ptr context;
 
+    // prefill/decode split: separate model and context for prefill
+    llama_model_ptr   pp_model;
+    llama_context_ptr pp_context;
+
     std::vector<llama_adapter_lora_ptr> lora;
 
     std::vector<common_sampler_ptr> samplers;
@@ -1291,6 +1296,36 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
+
+    // PP split: route main model to the decode device
+    ggml_backend_dev_t dec_dev_list[2] = { nullptr, nullptr };
+    if (!params.pp_dev.empty() && !params.dec_dev.empty()) {
+        ggml_backend_dev_t dec_dev = nullptr;
+        const size_t n_regs = ggml_backend_reg_count();
+        for (size_t r = 0; r < n_regs && !dec_dev; r++) {
+            auto reg = ggml_backend_reg_get(r);
+            const size_t n_devs = ggml_backend_reg_dev_count(reg);
+            for (size_t i = 0; i < n_devs; i++) {
+                auto dev = ggml_backend_reg_dev_get(reg, i);
+                const char * name = ggml_backend_dev_name(dev);
+                if (name && std::string(name) == params.dec_dev) {
+                    dec_dev = dev;
+                    break;
+                }
+            }
+        }
+        if (dec_dev) {
+            dec_dev_list[0] = dec_dev;
+            mparams.devices = dec_dev_list;
+            mparams.split_mode = LLAMA_SPLIT_MODE_NONE;
+            mparams.main_gpu = 0;
+            COM_INF("PP split: main model -> '%s', PP model -> '%s' (pp_ngl=%d)\n",
+                    params.dec_dev.c_str(), params.pp_dev.c_str(), params.pp_ngl);
+        } else {
+            COM_ERR("decode device '%s' not found\n", params.dec_dev.c_str());
+            return;
+        }
+    }
 
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");
@@ -1406,6 +1441,63 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     set_process_priority(params.cpuparams.priority);
 
     pimpl->threadpools.init(lctx, params);
+
+    // prefill/decode split: create a separate model and context for prefill
+    if (!params.pp_dev.empty() && !params.dec_dev.empty()) {
+        COM_INF("creating PP context on device '%s' (pp_ngl = %d)\n", params.pp_dev.c_str(), params.pp_ngl);
+
+        auto mparams_pp = llama_model_default_params();
+        mparams_pp.n_gpu_layers = params.pp_ngl;
+        mparams_pp.split_mode   = LLAMA_SPLIT_MODE_NONE;
+        mparams_pp.main_gpu     = 0;
+
+        // find the device by name
+        ggml_backend_dev_t pp_dev = nullptr;
+        const size_t n_regs = ggml_backend_reg_count();
+        for (size_t r = 0; r < n_regs && !pp_dev; r++) {
+            auto reg = ggml_backend_reg_get(r);
+            const size_t n_devs = ggml_backend_reg_dev_count(reg);
+            for (size_t i = 0; i < n_devs; i++) {
+                auto dev = ggml_backend_reg_dev_get(reg, i);
+                const char * name = ggml_backend_dev_name(dev);
+                if (name && std::string(name) == params.pp_dev) {
+                    pp_dev = dev;
+                    break;
+                }
+            }
+        }
+        if (!pp_dev) {
+            COM_ERR("PP device '%s' not found\n", params.pp_dev.c_str());
+            return;
+        }
+
+        // set the device for the PP model (single device, NULL-terminated)
+        ggml_backend_dev_t pp_dev_list[2] = { pp_dev, nullptr };
+        mparams_pp.devices = pp_dev_list;
+
+        llama_model * pp_model = nullptr;
+        try {
+            pp_model = llama_model_load_from_file(params.model.path.c_str(), mparams_pp);
+        } catch (const std::exception & e) {
+            fprintf(stderr, "PP model load exception: %s\n", e.what());
+            return;
+        }
+        if (pp_model == NULL) {
+            fprintf(stderr, "failed to load PP model\n");
+            return;
+        }
+        pimpl->pp_model.reset(pp_model);
+
+        auto cparams_pp = common_context_params_to_llama(params);
+        llama_context * pp_ctx = llama_init_from_model(pp_model, cparams_pp);
+        if (pp_ctx == NULL) {
+            fprintf(stderr, "failed to create PP context\n");
+            return;
+        }
+        pimpl->pp_context.reset(pp_ctx);
+
+        fprintf(stderr, "PP context created\n");
+    }
 }
 
 llama_model * common_init_result::model() {
@@ -1414,6 +1506,14 @@ llama_model * common_init_result::model() {
 
 llama_context * common_init_result::context() {
     return pimpl->context.get();
+}
+
+llama_model * common_init_result::pp_model() {
+    return pimpl->pp_model.get();
+}
+
+llama_context * common_init_result::pp_context() {
+    return pimpl->pp_context.get();
 }
 
 common_sampler * common_init_result::sampler(llama_seq_id seq_id) {

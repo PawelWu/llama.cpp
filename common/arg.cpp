@@ -2855,6 +2855,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SPLIT_MODE"));
     add_opt(common_arg(
+        {"--pp-dev"}, "DEVICE",
+        "device name for prefill (e.g. CUDA0), empty = disabled",
+        [](common_params & params, const std::string & value) {
+            params.pp_dev = value;
+        }
+    ).set_env("LLAMA_ARG_PP_DEV"));
+    add_opt(common_arg(
+        {"--dec-dev"}, "DEVICE",
+        "device name for decode (e.g. Vulkan1), empty = disabled",
+        [](common_params & params, const std::string & value) {
+            params.dec_dev = value;
+        }
+    ).set_env("LLAMA_ARG_DEC_DEV"));
+    add_opt(common_arg(
+        {"--pp-ngl"}, "N",
+        "number of layers to offload to the PP device, -1 = all (default: -1)",
+        [](common_params & params, const std::string & value) {
+            params.pp_ngl = std::stoi(value);
+        }
+    ).set_env("LLAMA_ARG_PP_NGL"));
+    add_opt(common_arg(
         {"-ts", "--tensor-split"}, "N0,N1,N2,...",
         "fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1",
         [](common_params & params, const std::string & value) {

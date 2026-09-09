@@ -936,6 +936,14 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
+    // copy the first n_cells cells of stream 0 from ctx_src to ctx_dst
+    // the two contexts must use the same model and the same n_ctx
+    // used for prefill/decode split: transfer the KV state from the prefill device to the decode device
+    LLAMA_API void llama_kv_cache_copy_from(
+            struct llama_context * ctx_dst,
+      const struct llama_context * ctx_src,
+                       uint32_t    n_cells);
+
     //
     // Decoding
     //

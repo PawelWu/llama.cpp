@@ -6,7 +6,13 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
+#include "llama-kv-cache-iswa.h"
+
+#include <typeinfo>
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -335,6 +341,29 @@ llama_context::llama_context(
                 throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
             }
             backends.emplace_back(backend);
+        }
+
+        // a context sharing tensors from another model (e.g. a draft using the target's lm_head)
+        // must also be able to run ops on the devices holding those tensors
+        if (cparams.ctx_other) {
+            const llama_model * model_other = llama_get_model(cparams.ctx_other);
+            for (const auto & dev : model_other->devices) {
+                bool found = false;
+                for (const auto & dev0 : model.devices) {
+                    if (dev0.dev == dev.dev) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) {
+                    continue;
+                }
+                ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
+                if (backend == nullptr) {
+                    throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
+                }
+                backends.emplace_back(backend);
+            }
         }
 
         // add ACCEL backends (such as BLAS)
@@ -4203,6 +4232,63 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+// extract all llama_kv_cache instances from a memory (handles plain, hybrid, hybrid_iswa)
+static void get_kv_caches(llama_memory_i * mem, std::vector<llama_kv_cache *> & out) {
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (kv) {
+        out.push_back(kv);
+        return;
+    }
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
+    if (hybrid) {
+        auto * attn = hybrid->get_mem_attn();
+        if (attn) out.push_back(attn);
+        return;
+    }
+    auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(mem);
+    if (iswa) {
+        auto * base = iswa->get_base();
+        auto * swa  = iswa->get_swa();
+        if (base) out.push_back(base);
+        if (swa)  out.push_back(swa);
+        return;
+    }
+    auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem);
+    if (hybrid_iswa) {
+        auto * iswa2 = hybrid_iswa->get_mem_attn();
+        if (iswa2) {
+            auto * base = iswa2->get_base();
+            auto * swa  = iswa2->get_swa();
+            if (base) out.push_back(base);
+            if (swa)  out.push_back(swa);
+        }
+        return;
+    }
+}
+
+void llama_kv_cache_copy_from(llama_context * ctx_dst, const llama_context * ctx_src, uint32_t n_cells) {
+    ctx_dst->synchronize();
+
+    auto * mem_dst = llama_get_memory(ctx_dst);
+    auto * mem_src = llama_get_memory(ctx_src);
+
+    std::vector<llama_kv_cache *> kv_dst_list;
+    std::vector<llama_kv_cache *> kv_src_list;
+    get_kv_caches(mem_dst, kv_dst_list);
+    get_kv_caches(const_cast<llama_memory_i *>(mem_src), kv_src_list);
+
+    if (kv_dst_list.empty() || kv_src_list.empty() || kv_dst_list.size() != kv_src_list.size()) {
+        LLAMA_LOG_ERROR("%s: failed to get KV caches (dst=%zu, src=%zu, dst_type=%s, src_type=%s)\n",
+            __func__, kv_dst_list.size(), kv_src_list.size(),
+            typeid(*mem_dst).name(), typeid(*mem_src).name());
+        return;
+    }
+
+    for (size_t i = 0; i < kv_dst_list.size(); ++i) {
+        kv_dst_list[i]->copy_from(*kv_src_list[i], n_cells);
+    }
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
