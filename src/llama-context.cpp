@@ -337,6 +337,29 @@ llama_context::llama_context(
             backends.emplace_back(backend);
         }
 
+        // a context sharing tensors from another model (e.g. a draft using the target's lm_head)
+        // must also be able to run ops on the devices holding those tensors
+        if (cparams.ctx_other) {
+            const llama_model * model_other = llama_get_model(cparams.ctx_other);
+            for (const auto & dev : model_other->devices) {
+                bool found = false;
+                for (const auto & dev0 : model.devices) {
+                    if (dev0.dev == dev.dev) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) {
+                    continue;
+                }
+                ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
+                if (backend == nullptr) {
+                    throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
+                }
+                backends.emplace_back(backend);
+            }
+        }
+
         // add ACCEL backends (such as BLAS)
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
