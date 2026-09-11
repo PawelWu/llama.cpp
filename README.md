@@ -1,3 +1,7 @@
+This is a fork of llama.cpp with tiny modification that fixes issue when you select --spec-draft-device to be a device that is not in list in --device. 
+Error message I was getting is "...cannot run the operation (NONE)" (sorry forgot the first part).
+I can't explain what or how its fixed, Qwen3.8 27B fixed it for me. Now I can mix --device Vulkan1 with --spec-draft-device CUDA0 and it works fine.
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
