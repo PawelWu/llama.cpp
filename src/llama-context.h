@@ -246,6 +246,7 @@ public:
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+    ggml_status graph_compute_stream(ggml_cgraph * gf, const llm_graph_result * res);
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(

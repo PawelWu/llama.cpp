@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-impl.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -19,6 +20,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -125,6 +127,7 @@ llama_context::llama_context(
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
+    cparams.stream                  = params.stream;
     cparams.warmup                  = false;
 
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
@@ -482,6 +485,12 @@ llama_context::llama_context(
         }
 
         cparams.pipeline_parallel = pipeline_parallel;
+
+        if (cparams.stream) {
+            // streaming requires n_copies > 1 in the scheduler for double buffering
+            cparams.pipeline_parallel = true;
+            LLAMA_LOG_INFO("%s: streaming enabled, forcing pipeline parallelism\n", __func__);
+        }
 
         if (cparams.pipeline_parallel) {
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
@@ -1422,7 +1431,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const auto status = cparams.stream
+        ? graph_compute_stream(res->get_gf(), res)
+        : graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2547,6 +2558,12 @@ ggml_status llama_context::graph_compute(
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
+}
+
+ggml_status llama_context::graph_compute_stream(ggml_cgraph * gf, const llm_graph_result * res) {
+    // streaming mode: use the full graph with n_copies > 1
+    // the scheduler's copy/compute overlap handles weight streaming
+    return graph_compute(gf, false);
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {
@@ -3680,6 +3697,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.stream                      =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

@@ -2800,6 +2800,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(
+        {"--stream"},
+        "stream weights from pinned RAM to GPU in chunks (double buffering)",
+        [](common_params & params) {
+            params.stream = true;
+        }
+    ).set_env("LLAMA_ARG_STREAM"));
+    add_opt(common_arg(
         {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"
