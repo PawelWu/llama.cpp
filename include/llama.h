@@ -416,6 +416,11 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // device that should run weight ops of large batches (prefill) instead of the device that
+        // holds the weights - the weights are copied to this device per batch, decode is not affected
+        // nullptr = disabled
+        ggml_backend_dev_t pp_backend;
     };
 
     struct llama_model_tensor_override {

@@ -64,4 +64,6 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+
+    ggml_backend_dev_t pp_backend; // device that should run weight ops of large batches, nullptr = disabled
 };

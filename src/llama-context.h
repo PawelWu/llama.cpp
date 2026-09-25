@@ -55,6 +55,9 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
+    // directs weight ops of large batches to cparams.pp_backend
+    void sched_set_pp_backend();
+
     void synchronize();
 
     const llama_model   & get_model()   const;

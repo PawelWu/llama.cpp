@@ -1557,6 +1557,13 @@ bool llama_model_loader::load_all_data(
             return nullptr;
         }
 
+        // staging buffers are read into via get_base(), so they must be CPU-addressable
+        if (!ggml_backend_buft_is_host(host_buft)) {
+            LLAMA_LOG_DEBUG("%s: host buffer type %s is not CPU-addressable for async uploads\n", func,
+                ggml_backend_buft_name(host_buft));
+            return nullptr;
+        }
+
         // If the backend is supported, create pinned memory buffers and events for synchronisation.
         for (size_t idx = 0; idx < n_buffers; ++idx) {
             auto * buf = ggml_backend_buft_alloc_buffer(host_buft, buffer_size);

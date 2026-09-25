@@ -319,6 +319,11 @@ extern "C" {
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
+    // run weight ops of large batches on this backend instead of the backend that holds the weights
+    // the weights are copied into this backend's compute buffer, one set per graph split
+    // ignored if the backend is not in the scheduler
+    GGML_API void                 ggml_backend_sched_set_offload_backend(ggml_backend_sched_t sched, ggml_backend_t backend);
+
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success

@@ -380,11 +380,28 @@ static ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backe
 static size_t ggml_backend_vk_buffer_type_get_alignment(ggml_backend_buffer_type_t buft);
 static size_t ggml_backend_vk_buffer_type_get_max_size(ggml_backend_buffer_type_t buft);
 static size_t ggml_backend_vk_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor);
+static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size);
+static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft);
+static size_t ggml_backend_vk_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft);
+static void ggml_backend_vk_host_buffer_type_free_buffer(ggml_backend_buffer_t buffer);
 static ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface = {
     /* .get_name         = */ ggml_backend_vk_buffer_type_name,
     /* .alloc_buffer     = */ ggml_backend_vk_buffer_type_alloc_buffer,
     /* .get_alignment    = */ ggml_backend_vk_buffer_type_get_alignment,
     /* .get_max_size     = */ ggml_backend_vk_buffer_type_get_max_size,
+    /* .get_alloc_size   = */ ggml_backend_vk_buffer_type_get_alloc_size,
+    /* .is_host          = */ NULL,
+};
+
+// per-device host buffer types (vk_device_struct::host_buffer_type) share this iface
+// get_name reuses the device buft fn so ggml_backend_buffer_is_vk() accepts these buffers
+// is_host stays NULL: the data must be accessed through vk set/get tensor (the tensor base is
+// fake), get_base() users must fall back to a CPU-addressable buffer type instead
+static ggml_backend_buffer_type_i ggml_backend_vk_host_buffer_type_interface = {
+    /* .get_name         = */ ggml_backend_vk_buffer_type_name,
+    /* .alloc_buffer     = */ ggml_backend_vk_host_buffer_type_alloc_buffer,
+    /* .get_alignment    = */ ggml_backend_vk_host_buffer_type_get_alignment,
+    /* .get_max_size     = */ ggml_backend_vk_host_buffer_type_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_vk_buffer_type_get_alloc_size,
     /* .is_host          = */ NULL,
 };
@@ -1179,6 +1196,7 @@ struct vk_device_struct {
     vk_buffer sync_staging;
 
     ggml_backend_buffer_type buffer_type;
+    ggml_backend_buffer_type host_buffer_type;
 
     bool disable_fusion;
     bool disable_host_visible_vidmem;
@@ -7475,6 +7493,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
             /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name, device },
         };
 
+        device->host_buffer_type = {
+            /* .iface    = */ ggml_backend_vk_host_buffer_type_interface,
+            /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), idx),
+            /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name + std::string("_Host"), device },
+        };
+
         device->fence = device->device.createFence({});
 
         device->idx = idx;
@@ -9125,6 +9149,14 @@ static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& sr
         ggml_vk_queue_command_pools_cleanup(src->device);
     } else {
         VK_LOG_DEBUG("ggml_vk_buffer_copy(MULTI_DEVICE, " << size << ")");
+
+        if (src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
+            // source is host-visible and already mapped, skip the GPU copy to staging and let the
+            // dst device stage it from the mapped memory directly
+            ggml_vk_buffer_write(dst, dst_offset, (uint8_t *)src->ptr + src_offset, size);
+            return;
+        }
+
         // Copy device to device
         ggml_vk_ensure_sync_staging_buffer(src->device, size);
 
@@ -17095,7 +17127,6 @@ static const char * ggml_backend_vk_buffer_type_name(ggml_backend_buffer_type_t 
 
     return ctx->name.c_str();
 }
-
 static ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     VK_LOG_MEMORY("ggml_backend_vk_buffer_type_alloc_buffer(" << size << ")");
     ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
@@ -17138,7 +17169,55 @@ ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num) {
     return &dev->buffer_type;
 }
 
+// per-device host buffer type
+//
+// Allocates a host-visible vk_buffer on the device it belongs to, so the device claims it in
+// supports_buft and reads it in place. This is what makes zero-copy decode work on integrated
+// GPUs with weights in pinned system memory (which on UMA is the same physical memory the
+// device-local buffers use).
+
+static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    VK_LOG_MEMORY("ggml_backend_vk_host_buffer_type_alloc_buffer(" << size << ")");
+    ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *)buft->context;
+
+    vk_buffer dev_buffer = nullptr;
+    try {
+        // coherent-only: cached host memory slows down GPU-side reads on UMA (snoop overhead);
+        // keep cached as a fallback for drivers that lack an uncached host-visible type
+        dev_buffer = ggml_vk_create_buffer(ctx->device, size,
+            {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+             vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCached | vk::MemoryPropertyFlagBits::eHostCoherent});
+    } catch (const vk::SystemError& e) {
+        GGML_LOG_WARN("ggml_vulkan: Failed to allocate host-visible buffer (%s)\n", e.what());
+        return nullptr;
+    }
+
+    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(ctx->device, std::move(dev_buffer), ctx->name);
+
+    return ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, bufctx, size);
+}
+
+static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+    ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *)buft->context;
+    return ctx->device->properties.limits.minMemoryMapAlignment;
+}
+
+static size_t ggml_backend_vk_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
+    ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *)buft->context;
+    return ctx->device->suballocation_block_size;
+}
+
+static void ggml_backend_vk_host_buffer_type_free_buffer(ggml_backend_buffer_t buffer) {
+    VK_LOG_MEMORY("ggml_backend_vk_host_buffer_type_free_buffer()");
+    ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
+    ggml_vk_destroy_buffer(ctx->dev_buffer);
+    delete ctx;
+}
+
 // host buffer type
+// global pinned-memory type bound to Vulkan device 0, kept for the discrete-GPU path (tiny BAR
+// windows make in-place device reads of host buffers useless there) and for pinned staging allocations
+// integrated GPUs get a per-device host-visible type via ggml_backend_vk_device_get_host_buffer_type
 
 static const char * ggml_backend_vk_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
     return GGML_VK_NAME "_Host";
@@ -17151,8 +17230,8 @@ static void ggml_backend_vk_host_buffer_free_buffer(ggml_backend_buffer_t buffer
     ggml_vk_host_free(vk_instance.devices[0], buffer->context);
 }
 
-static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    VK_LOG_MEMORY("ggml_backend_vk_host_buffer_type_alloc_buffer(" << size << ")");
+static ggml_backend_buffer_t ggml_backend_vk_pinned_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    VK_LOG_MEMORY("ggml_backend_vk_pinned_buffer_type_alloc_buffer(" << size << ")");
 
     size += 32;  // Behave like the CPU buffer type
     void * ptr = nullptr;
@@ -17173,27 +17252,25 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
     UNUSED(buft);
 }
 
-static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+static size_t ggml_backend_vk_pinned_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     return vk_instance.devices[0]->properties.limits.minMemoryMapAlignment;
 
     UNUSED(buft);
 }
 
-static size_t ggml_backend_vk_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
+static size_t ggml_backend_vk_pinned_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
     return vk_instance.devices[0]->suballocation_block_size;
 
     UNUSED(buft);
 }
 
-// Should be changed to return device-specific host buffer type
-// but that probably requires changes in llama.cpp
-ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type() {
+ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(void) {
     static struct ggml_backend_buffer_type ggml_backend_vk_buffer_type_host = {
         /* .iface    = */ {
             /* .get_name         = */ ggml_backend_vk_host_buffer_type_name,
-            /* .alloc_buffer     = */ ggml_backend_vk_host_buffer_type_alloc_buffer,
-            /* .get_alignment    = */ ggml_backend_vk_host_buffer_type_get_alignment,
-            /* .get_max_size     = */ ggml_backend_vk_host_buffer_type_get_max_size,
+            /* .alloc_buffer     = */ ggml_backend_vk_pinned_buffer_type_alloc_buffer,
+            /* .get_alignment    = */ ggml_backend_vk_pinned_buffer_type_get_alignment,
+            /* .get_max_size     = */ ggml_backend_vk_pinned_buffer_type_get_max_size,
             /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
             /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
         },
@@ -19310,7 +19387,16 @@ static ggml_backend_buffer_type_t ggml_backend_vk_device_get_buffer_type(ggml_ba
 }
 
 static ggml_backend_buffer_type_t ggml_backend_vk_device_get_host_buffer_type(ggml_backend_dev_t dev) {
-    UNUSED(dev);
+    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+
+    vk_device device = ggml_vk_get_device(ctx->device);
+
+    // integrated GPUs get a real host-visible vk_buffer on themselves, so weights in it are
+    // device-owned and read in place (UMA: same physical RAM). discrete GPUs keep the global
+    // pinned-memory type: a host buffer there cannot be read in place (BAR window too small)
+    if (device->uma) {
+        return &device->host_buffer_type;
+    }
     return ggml_backend_vk_host_buffer_type();
 }
 

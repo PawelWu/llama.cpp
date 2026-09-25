@@ -271,6 +271,7 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.pp_backend = params.pp_backend;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -434,7 +435,9 @@ llama_context::llama_context(
                 // use the host buffer of the first device CPU for faster transfer of the intermediate state
                 const auto & dev = model.devices[0];
                 auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev);
-                if (host_buft) {
+                // the device may report a non-CPU-addressable host buffer (e.g. a host-visible
+                // vk_buffer), which the CPU backend cannot use as its scheduler buffer type
+                if (host_buft && ggml_backend_buft_is_host(host_buft)) {
                     buft = host_buft;
                 }
             }
@@ -453,7 +456,9 @@ llama_context::llama_context(
             model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
-            !model.has_tensor_overrides();
+            !model.has_tensor_overrides() &&
+            // weight copies would be kept alive in every copy slot, which needs a buffer as large as the model
+            !cparams.pp_backend;
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
@@ -602,6 +607,21 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 }
 
+void llama_context::sched_set_pp_backend() {
+    if (!cparams.pp_backend) {
+        return;
+    }
+
+    for (auto & backend : backend_ptrs) {
+        if (ggml_backend_get_device(backend) == cparams.pp_backend) {
+            ggml_backend_sched_set_offload_backend(sched.get(), backend);
+            return;
+        }
+    }
+
+    LLAMA_LOG_WARN("%s: %s is not used by this context, ignoring\n", __func__, ggml_backend_dev_name(cparams.pp_backend));
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -626,6 +646,7 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    sched_set_pp_backend();
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -661,6 +682,7 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                sched_set_pp_backend();
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -2145,7 +2167,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         // try to use the host buffer of the device where the output tensor is allocated for faster transfer to system memory
         auto * output_dev = model.dev_output();
         auto * output_dev_host_buft = output_dev ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
-        if (output_dev_host_buft) {
+        // logits and sampling views use get_base() directly, so the buffer must be CPU-addressable
+        if (output_dev_host_buft && ggml_backend_buft_is_host(output_dev_host_buft)) {
             buft = output_dev_host_buft;
         }
         buf_output.reset(ggml_backend_buft_alloc_buffer(buft, new_size));
@@ -3675,6 +3698,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.pp_backend                  =*/ nullptr,
     };
 
     return result;

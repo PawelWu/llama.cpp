@@ -1680,6 +1680,26 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
 struct llama_model_params common_model_params_to_llama(common_params & params) {
     auto mparams = llama_model_default_params();
 
+    // scheduling only: the device list order decides where the weights are placed, the prefill
+    // device is just appended to make sure it is available to the scheduler
+    if (params.pp_dev != nullptr) {
+        auto it = std::find(params.devices.begin(), params.devices.end(), params.pp_dev);
+
+        if (it == params.devices.end()) {
+            auto back = params.devices.end();
+            if (!params.devices.empty() && params.devices.back() == nullptr) {
+                --back;
+            }
+            params.devices.insert(back, params.pp_dev);
+        }
+
+        COM_INF("pp_device = %s (%s)\n", ggml_backend_dev_name(params.pp_dev), ggml_backend_dev_description(params.pp_dev));
+
+        if (params.n_gpu_layers != 0) {
+            COM_WRN("%s", "--pp-dev copies the weights of offloaded layers to the prefill device on every prefill batch\n");
+        }
+    }
+
     if (!params.devices.empty()) {
         mparams.devices = params.devices.data();
     }
@@ -1746,6 +1766,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
+    cparams.pp_backend        = params.pp_dev;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
 
