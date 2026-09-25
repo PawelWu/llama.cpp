@@ -323,6 +323,52 @@ loader guard - the ReadFile AV is gone. Both verified with llama-server.exe kill
 Phase 1 VERIFIED. Next: Phase 2 - stash pop (drop the stash's mmap_support=true hunk), rebuild,
 H2 on Qwen3.8-27B: -dev Vulkan1 -ngl 99 -ot ".*=CPU" --load-mode none --pp-dev Vulkan0.
 
+### FIFTH FINDING: my MULTI_DEVICE host-visible shortcut was the PP killer
+
+Stash restore notes (for reference): `git stash pop` refused (same files dirty); `git apply --3way`
+silently rolled back; what worked was `git apply --reject` (all hunks clean except arg.cpp +
+common.cpp) plus `git checkout stash@{0} -- <files>` for the 8 files we had not touched ourselves
+(arg.cpp, common.cpp, common.h, ggml-backend.h/.cpp, llama.h, llama-context.h, llama-cparams.h).
+llama-context.cpp pp_backend hunks had already landed from the aborted --3way. The stash's
+mmap_support=true hunk was applied by --reject and then reverted by hand (handoff 2.1).
+
+H2 first run: PP 1.48 t/s. GGML_SCHED_PROFILE showed the split: PP graph = 13.2 GB weight copies
+in 91-181 s (~100 MB/s) vs compute 0.6-1.6 s. Cause: the Phase-1 MULTI_DEVICE shortcut in
+ggml_vk_buffer_copy (memcpy from mapped host src) CPU-READS uncached UMA sysmem = ~100 MB/s.
+The upstream staging round trip (V1 GPU copy to staging, CPU memcpy staging-to-staging, V0 GPU
+write) never CPU-reads weight data: 4.5-5.5 GB/s. Shortcut removed (with a comment); copies now
+2.4-2.9 s per 353-token graph.
+
+### H2 results (Qwen3.8-27B-MXFP4, c=85248 b=ub=1024, q4_1 KV, fa, server killed first)
+
+| config | PP t/s | TG t/s | notes |
+|---|---|---|---|
+| A baseline (8.1b, weights V1 device buft) | 58.8 | 3.75 | reference |
+| D pp-dev (8.1b, weights V1 device buft) | 73.5 | 2.98 | same 1.1k splits, same copy path |
+| streaming (8.9, MIN_BATCH=1) | 35.6 | - | 14.5 GB/token |
+| H2 no-pp-dev: weights V1_Host, graph splits = 1 | 40.5 | **4.16** | best TG ever, zero copies |
+| H2: weights V1_Host + --pp-dev Vulkan0 | **47.5** | 2.13 | 1150 splits (PP) / 134 (decode) |
+
+Readings:
+1. All 15.8 GB land in Vulkan1_Host, load clean, decode-only graph is one split on V1 and beats
+   every previous config (4.16). The host-buft concept is proven at 27B scale.
+2. --pp-dev PP 47.5: compute runs on V0 (353-token profiled graph: compute 0.5-1.5 s only), but
+   the 13.2 GB per-batch weight copy (2.4-2.9 s, synchronous per copy: two GPU submits + fence
+   waits + CPU memcpy) eats the margin. Old D got 73.5 because its copies came from the V1 device
+   buffer... same sysmem, same path - the remaining D vs H2 gap is unexplained; candidates:
+   per-copy fence sync (1511 copies x submit+wait), V0 holding a 104 MiB KV slice (D had 64),
+   and HOST_COHERENT-only source (flipped from cached for TG; may slow the GPU-side copy reads).
+3. TG 2.13 vs 4.16 without pp-dev: decode graph gets 134 splits and 197 activation copies because
+   V0 holds a KV slice + split overhead. Same qualitative hit as 8.1b D (2.98 vs 3.75), larger.
+4. Next lever for PP: zero-copy prefill by importing the V1_Host allocation into V0
+   (VK_EXT_external_memory_host import path already exists in ggml_vk_create_buffer via
+   import_ptr; ggml_vk_tensor_subbuffer + device->pinned_memory registry). Register each
+   Vulkan1_Host buffer once as a V0-imported buffer, then PP ops on V0 bind the same physical
+   memory. That removes the whole 13.2 GB/batch copy. Bigger change, needs design care.
+5. TG lever: keep V0 out of decode. Check why 104 MiB of KV lands on V0 (no V0 model buffer is
+   logged, so dev_layer says V1; suspect reserve-time forced assignment or gpu buft list order),
+   or evaluate whether server use cases accept pp-dev TG hit for long-prompt PP win.
+
 ### Then Phase 2 (unchanged from plan above)
 
 1. `git stash pop` (stash's ggml-vulkan hunk is just mmap_support=true at 19336 - DROP it,
@@ -339,4 +385,124 @@ H2 on Qwen3.8-27B: -dev Vulkan1 -ngl 99 -ot ".*=CPU" --load-mode none --pp-dev V
 4. Regression: gemma case A (`-dev Vulkan1 -ngl 99`, no -ot) must be byte-identical behavior to
    before (device bufts untouched); gemma `-ngl 0` now goes through the new host buft - compare
    PP/TG vs handoff section 11 rows C/D.
+
+### SIXTH FINDING: V0 gets 8 layers (and their KV) because --pp-dev APPENDS it to the device list
+
+h2_qwen.log: base KV cache (85248 cells, 16 full-attn layers, 1665 MiB total) is split
+Vulkan0 104.06 MiB + Vulkan1 1560.94 MiB. 104.06 = exactly 1/16. Cause: common.cpp pp_dev block
+APPENDS Vulkan0 to params.devices -> 2-GPU model. Default split is by free memory (llama-model.cpp
+1459: splits[i] = free; V1 reports ~46 GB free UMA, V0 ~5 GB) -> normalized split point ~0.90 ->
+get_layer_buft_list upper_bound assigns the LAST layers (61-65) to V0. The -ot ".*=CPU" override
+moves their WEIGHTS into Vulkan1_Host, but layer ASSIGNMENT still controls: KV cache buft
+(llama-kv-cache.cpp 214: dev_layer(il) -> V0 for those layers) and the graph callback
+(llama-context.cpp:2557 n_tokens<32 branch) pins norm/l_last onto dev_layer(il) = V0. That is the
+134 decode splits and the 2.13 TG (vs 4.16 without pp-dev).
+
+FIX (designed, not yet applied): in the common.cpp pp_dev block, when pp_dev was appended (it was
+not in the user's device list) and the user gave no explicit -ts, set
+tensor_split[idx_of_pp_dev] = 0.001f (and leave others 0 -> not all_zero -> splits taken from
+tensor_split directly; 0.001/total ~ 0.00007 -> upper_bound assigns 0 layers to V0; the epsilon
+instead of 0 protects the all_zero==true fallback and division). Do NOT touch anything when the
+user passes -ts explicitly (respect user). After fix, expect: no Vulkan0 KV buffer line,
+splits bs=1 = 1, TG = 4.16.
+
+### OPEN ISSUE 7: PP rate decays during long prompts; iGPU 90% / dGPU 5% during them
+
+Symptom (server, long prompts): PP starts 100+ t/s then drops sharply. Task manager: iGPU ~90%,
+dGPU ~5% during long prompts.
+
+Data we have (h2_qwen.log, 1386 tok): chunk1 32.6 t/s -> chunk2 59.0 t/s (cumulative avg
+converging up to the 47.5 final), no decay visible at this prompt length. The decay is only seen
+on long server prompts, so we have NO per-ubatch data for one yet. Needed first: a controlled
+long-prompt run (server or cli, ub=1024, lv 5) capturing (a) the per-ubatch
+"prompt processing, n_tokens = N, progress, t/s" lines, (b) nvidia-smi dres and task-manager iGPU
+samples every few seconds, (c) GGML_SCHED_PROFILE=1 for copy/compute split per ubatch.
+
+Hypotheses, ordered:
+1. iGPU 90% = the iGPU is doing the weight copies / staging memcpys (its 3D/Video engines or
+   compute queue runs the staging copies), NOT the matmuls (compute is on V0). As the prompt
+   grows, KV-cache reads/writes and the growing tail of V0-owned layers move more work to V1.
+2. Checkpoint growth: "created context checkpoint N of 32 ... size = 149.626 MiB" - up to 32 x
+   150 MiB ~ 4.8 GB of seq-state buffers are allocated on the KV devices as the prompt grows
+   (llama-context.cpp 2053 out_ids copying, create_check). On a 6 GB V0 that could evict/slow
+   allocations mid-prompt; on V1 (UMA) it competes with the 15.8 GB host weights for bandwidth.
+3. UMA bandwidth contention: as KV grows, every ubatch both copies 13.2 GB of weights (V1->staging
+   sysmem traffic) AND streams more KV cells; both hit the same 62 GB shared DRAM. iGPU saturates,
+   PP decays. dGPU idles waiting for copies (5%).
+4. Thermal/power shift on the APU (760M shares power budget with CPU); long sustained copy loads
+   downclock the iGPU. Check with a sensors log during a long run.
+5. Scheduler split explosion with growing n_kv: split count for PP graph can grow with context
+   (kv cache views/copies per split); check "graph splits" in server logs at different prompt
+   lengths.
+
+Investigation plan (next session):
+1. Reproduce with logs: llama-server (same params as H2) + a 20-30k token prompt; log timestamps
+   of each ubatch progress line; sample nvidia-smi + iGPU usage concurrently.
+2. From h2_prof.log methodology, run GGML_SCHED_PROFILE=1 on a 4k prompt cli run to see if copy
+   time per ubatch grows with position (KV traffic) or stays flat (then it is thermal).
+3. Check checkpoint allocation: grep "created context checkpoint" counts + sizes; try -ck 0 or
+   the server flag to disable checkpoints (cache_reuse) to test hypothesis 2 directly.
+4. If copies grow with position: the KV copy cost is per-split; after SIXTH FINDING fix re-measure
+   (V0 out of decode may also change the PP split topology).
+
+### SEVENTH FINDING (ISSUE 7 SOLVED): decay = FLASH_ATTN_EXT stuck on the KV device
+
+SIXTH FINDING fix applied first (epsilon-free tensor_split [1,0] in common.cpp pp_dev block,
+guarded by pp_appended && !ts_set && n_devs>=2): Vulkan0 KV buffer gone, decode splits 134 -> 97,
+TG 2.13 -> 3.07, PP unchanged. All layers now on V1.
+
+Controlled 12k-token run (h2_long.log, pre-fa-fix): per-chunk rates 93.7 -> 89.4 -> 86.3 -> 82.7
+-> 79.3 -> 68.3 -> 54.8 t/s. dGPU 0-9% util during PP. GGML_SCHED_PROFILE attribution per ubatch:
+copy FLAT at 4.22 s (13.2 GB, position-independent), compute grows LINEARLY 0.5 -> 9.5 s. Sched
+dump (GGML_SCHED_DEBUG=2): all 272 FLASH_ATTN nodes on Vulkan1, cause 2.sup (KV cache lives
+there), while matmuls are forced to V0. FA has no weight sources, and ggml-backend.cpp:980 skips
+it from the weights rule ("sinks tensor too small"), so attention follows the KV cache and stays
+on the iGPU at ANY batch size. Attention cost grows with n_kv -> linear compute growth -> decay,
+iGPU saturation (90%), dGPU idle (5%).
+
+FIX: in ggml_backend_sched_backend_id_from_cur (after the FA skip), force FA to the offload
+backend for prefill-sized batches (op_batch_size >= offload_backend_min_batch; FA rows =
+n_tokens so decode bs=1 is unaffected). Cost: FA reads K/V views from the V1 KV cache, so each
+layer's K/V (~1.7 GB/ubatch at 12k ctx, q4_1) is copied V1 -> V0; trivial vs the 13.2 GB weight
+copies and it removes every per-layer V1 compute island from the PP graph.
+
+RESULT (h2_long.log after fix, same 12k prompt, ub=1024):
+- PP overall 122.0 t/s (was 83.8), per-chunk FLAT ~152 t/s instant, no decay (last cumulative
+  dip = final chunk includes decode + checkpoints)
+- TG 3.41 t/s (was 3.07)
+- splits bs=1024: 1186 (FA/KV copies add boundaries, but every split now computes on the fast
+  device), bs=1 still 97
+- exit 0, sane output with q4_1 KV + FA on V0
+- safety: the new branch requires offload_backend_id >= 0, so runs without --pp-dev are
+  byte-identical (H1, case A/C unaffected); decode unaffected by the min_batch gate
+
+Remaining: TG 3.41 vs 4.16 no-pp-dev (97 decode splits from the norm/l_last callback pins -
+separate, small); zero-copy prefill via external memory import would remove the 13.2 GB copies
+and could push PP well past 150.
+
+### BACKLOG (user requests)
+
+1. CUDA0 as the prefill device. The mechanism is backend-agnostic (sched_set_offload_backend takes
+   any backend; CUDA reports a CPU-addressable pinned host buft so all the is_host guards behave
+   like upstream). Expected: PP weight copies ride the generic scheduler copy path
+   (sysmem -> CUDA pinned staging -> H2D DMA, typically 6-10 GB/s) instead of the V0 staging round
+   trip - possibly faster than Vulkan0. Watch: mixed Vulkan+CUDA driver state in one process,
+   GGML_CUDA_NO_PINNED=1 may become relevant again. Try after the feature is proven complete
+   on Vulkan. Needs a CUDA build of the same tree (current build is Vulkan-only).
+2. MTP-on-dGPU as the standard layout (matches the user's normal 27B dense setup: iGPU = main
+   device, dGPU = MTP draft / DSpark when adventurous). Current optimal.bat already does this via
+   --spec-draft-device Vulkan0. Validate the MTP+pp-dev combination end-to-end (draft graph and
+   verify graph interplay with the forced-offload, esp. that verify stays on V1 with default
+   MIN_BATCH=32), then check DSpark compatibility. Done for MTP in the real-work log: draft
+   graphs were the small 15-split ones, healthy; only verify was distorted by MIN_BATCH=1.
+
+### User's real-work observation (llama-atest.log, resolved)
+
+Decode profiled cycle: 3x small (15 splits, ~33 ms, MTP draft on V0) + 1x big (195 splits,
+~250 ms copies + ~880 ms compute). Cause: GGML_OP_OFFLOAD_MIN_BATCH=1 in the user's bat -
+stale from the old device-order mechanism, it forced verify (4-token batch) onto V0 too, so the
+verify graph ping-ponged and streamed KV over PCIe (user saw 200+ MB bursts in HWiNFO; iGPU 80% /
+dGPU 20% during decode). GGML_SCHED_PROFILE=1 was also on in a real-work run (serializes, skews).
+Fix: drop both env vars - captured in optimal.bat (project root). Everything else in the user's
+bat was already correct.
 

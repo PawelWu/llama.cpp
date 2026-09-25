@@ -9066,8 +9066,32 @@ static bool ggml_vk_buffer_read_async(vk_context subctx, vk_buffer& src, size_t 
     return ggml_vk_buffer_read_2d_async(subctx, src, offset, dst, size, size, size, 1, sync_staging);
 }
 
+static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& src, size_t src_offset, size_t size);
+
 static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t spitch, size_t dpitch, size_t width, size_t height) {
     VK_LOG_DEBUG("ggml_vk_buffer_read_2d(" << src->buffer << ", " << offset << ", " << width << ", " << height << ")");
+
+    // large reads from UNCACHED host-visible UMA memory (our per-device host buffers use
+    // coherent-only memory so the GPU can read it fast) must not be CPU-read directly: that
+    // runs at a few hundred MB/s. route them through the GPU: the device copies into its
+    // staging buffer (cached host memory), the CPU then memcpys out of cached memory at DRAM
+    // speed. small reads keep the direct path to avoid the submit/fence overhead
+    const bool uncached_uma = (src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) &&
+                              !(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached) &&
+                              src->device->uma;
+    if (uncached_uma && width * height > 16*1024*1024) {
+        ggml_vk_ensure_sync_staging_buffer(src->device, width * height);
+        if (width == spitch && width == dpitch) {
+            ggml_vk_buffer_copy(src->device->sync_staging, 0, src, offset, width * height);
+            memcpy(dst, src->device->sync_staging->ptr, width * height);
+        } else {
+            for (size_t i = 0; i < height; i++) {
+                ggml_vk_buffer_copy(src->device->sync_staging, 0, src, offset + i * spitch, width);
+                memcpy((uint8_t *) dst + i * dpitch, src->device->sync_staging->ptr, width);
+            }
+        }
+        return;
+    }
 
     // If the device is not an UMA device the memory is host-accessible through rebar. While writing
     // through PCIe is sufficient fast reading back data from PCIe is slower than going through
@@ -9150,12 +9174,9 @@ static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& sr
     } else {
         VK_LOG_DEBUG("ggml_vk_buffer_copy(MULTI_DEVICE, " << size << ")");
 
-        if (src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
-            // source is host-visible and already mapped, skip the GPU copy to staging and let the
-            // dst device stage it from the mapped memory directly
-            ggml_vk_buffer_write(dst, dst_offset, (uint8_t *)src->ptr + src_offset, size);
-            return;
-        }
+        // NOTE: do not shortcut host-visible sources with a CPU memcpy of the mapped pointer.
+        // CPU reads from uncached UMA host memory run at about 100 MB/s, while the GPU copy to
+        // staging runs at DRAM speed. Keep the staging round trip.
 
         // Copy device to device
         ggml_vk_ensure_sync_staging_buffer(src->device, size);

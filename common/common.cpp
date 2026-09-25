@@ -1685,12 +1685,40 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     if (params.pp_dev != nullptr) {
         auto it = std::find(params.devices.begin(), params.devices.end(), params.pp_dev);
 
+        bool pp_appended = false;
         if (it == params.devices.end()) {
             auto back = params.devices.end();
             if (!params.devices.empty() && params.devices.back() == nullptr) {
                 --back;
             }
             params.devices.insert(back, params.pp_dev);
+            pp_appended = true;
+        }
+
+        // the prefill device only receives weight copies, it should not store any layers. with
+        // the default split (by free memory) it would claim the last layers, which moves their
+        // KV cache and decode norm ops onto it and splits every decode graph. give it a zero
+        // layer share unless the user set one explicitly
+        bool ts_set = false;
+        for (size_t i = 0; i < llama_max_devices(); ++i) {
+            if (params.tensor_split[i] != 0.0f) {
+                ts_set = true;
+                break;
+            }
+        }
+        size_t n_devs = 0;
+        for (auto * dev : params.devices) {
+            if (dev == nullptr) {
+                break;
+            }
+            n_devs++;
+        }
+        if (pp_appended && !ts_set && n_devs >= 2) {
+            const size_t pp_idx = std::find(params.devices.begin(), params.devices.begin() + n_devs, params.pp_dev) - params.devices.begin();
+            for (size_t i = 0; i < llama_max_devices(); ++i) {
+                params.tensor_split[i] = i == pp_idx ? 0.0f : 1.0f;
+            }
+            COM_INF("%s", "pp_device layer share = 0 (weights are copied to it per batch, layers stay on the other devices)\n");
         }
 
         COM_INF("pp_device = %s (%s)\n", ggml_backend_dev_name(params.pp_dev), ggml_backend_dev_description(params.pp_dev));

@@ -976,6 +976,19 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
     // skip FLASH_ATTN_EXT since the sinks tensor is too small to choose a based based on it
     allow = allow && tensor->op != GGML_OP_FLASH_ATTN_EXT;
 
+    // FLASH_ATTN_EXT has no weight sources, so it would always follow its KV cache inputs.
+    // when a pp backend is selected, run it there for prefill-sized batches: attention cost
+    // grows with n_kv and would otherwise keep the whole prefill on the device that holds
+    // the KV cache, no matter how much faster the other devices are
+    if (sched->op_offload && sched->offload_backend_id >= 0 && tensor->op == GGML_OP_FLASH_ATTN_EXT &&
+        ggml_backend_sched_op_batch_size(tensor) >= sched->offload_backend_min_batch) {
+        ggml_backend_t backend = sched->backends[sched->offload_backend_id];
+        if (ggml_backend_supports_op(backend, tensor)) {
+            SET_CAUSE(tensor, "1.off_fa");
+            return sched->offload_backend_id;
+        }
+    }
+
     if (allow) {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             const struct ggml_tensor * src = tensor->src[i];
