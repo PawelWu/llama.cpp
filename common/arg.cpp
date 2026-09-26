@@ -2788,8 +2788,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "device that should run prefill (e.g. CUDA0)\n"
         "weight ops of prefill batches (batch size >= 32) run on it,\n"
         "the weights are copied to this device on every such batch, wherever they are stored\n"
-        "decode (n_tokens = 1) is not affected; to also run decode on a GPU,\n"
-        "set GGML_OP_OFFLOAD_MIN_BATCH=1 (decode then uses the first GPU in the device list)",
+        "decode (n_tokens = 1) is not affected",
         [](common_params & params, const std::string & value) {
             auto devices = parse_device_list(value);
             // parse_device_list pushes nullptr at back so devices is length 2 for single device.

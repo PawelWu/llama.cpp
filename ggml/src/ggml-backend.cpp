@@ -910,7 +910,7 @@ static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, co
     return -1;
 }
 
-#if 1 // DEBUG: temporary, revert before committing
+#if 0
 #define GGML_SCHED_MAX_SPLITS_DEBUG 4096
 static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML_SCHED_MAX_SPLIT_INPUTS][128]; // debug only
 #define SET_CAUSE(node, ...) sprintf(causes[hash_id(node)], __VA_ARGS__)
@@ -1059,7 +1059,7 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
         }
         if (sched->debug > 1) {
             ggml_backend_t tensor_backend = ggml_backend_sched_get_tensor_backend(sched, node);
-            GGML_LOG_DEBUG("node #%3d (%10.10s): %20.20s (%5.5s) [%-12s %-14s] use=%d,c=%d:", i, ggml_op_desc(node), node->name,
+            GGML_LOG_DEBUG("node #%3d (%10.10s): %20.20s (%5.5s) [%5.5s %8.8s] use=%d,c=%d:", i, ggml_op_desc(node), node->name,
                 fmt_size(ggml_nbytes(node)), tensor_backend ? ggml_backend_name(tensor_backend) : "NULL", GET_CAUSE(node),
                 graph->use_counts[ggml_hash_find(&graph->visited_hash_set, node)], node->flags & GGML_TENSOR_FLAG_COMPUTE ? 1 : 0);
             for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -1068,7 +1068,7 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
                     continue;
                 }
                 ggml_backend_t src_backend = ggml_backend_sched_get_tensor_backend(sched, src);
-                GGML_LOG_DEBUG(" %20.20s (%5.5s) [%-12s %-14s]", src->name,
+                GGML_LOG_DEBUG(" %20.20s (%5.5s) [%5.5s %8.8s]", src->name,
                     fmt_size(ggml_nbytes(src)), src_backend ? ggml_backend_name(src_backend) : "NULL", GET_CAUSE(src));
             }
             GGML_LOG_DEBUG("\n");
@@ -1720,20 +1720,9 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
-static bool ggml_backend_sched_profile_enabled(void) {
-    static const bool enabled = getenv("GGML_SCHED_PROFILE") != nullptr;
-    return enabled;
-}
-
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
-
-    const bool prof = ggml_backend_sched_profile_enabled();
-    int64_t prof_copy_us = 0;
-    int64_t prof_compute_us = 0;
-    size_t  prof_weight_bytes = 0;
-    int     prof_copies = 0;
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -1767,8 +1756,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (prefetched && is_weight) {
                 continue;
             }
-
-            const int64_t prof_t0 = prof ? ggml_time_us() : 0;
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -1901,14 +1888,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
             }
 
-            if (prof) {
-                ggml_backend_synchronize(split_backend);
-                prof_copy_us += ggml_time_us() - prof_t0;
-                prof_copies++;
-                if (is_weight) {
-                    prof_weight_bytes += ggml_nbytes(input);
-                }
-            }
         }
     };
 
@@ -1928,8 +1907,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         copy_split_inputs(split_id, false);
-
-        const int64_t prof_t1 = prof ? ggml_time_us() : 0;
 
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
@@ -1970,11 +1947,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        if (prof) {
-            ggml_backend_synchronize(split_backend);
-            prof_compute_us += ggml_time_us() - prof_t1;
-        }
-
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
@@ -1994,12 +1966,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         prev_backend_id = split_backend_id;
-    }
-
-    if (prof) {
-        fprintf(stderr, "sched_profile: splits=%d copies=%d weights=%.1f MiB copy=%.1f ms compute=%.1f ms\n",
-                sched->n_splits, prof_copies, prof_weight_bytes / (1024.0 * 1024.0),
-                prof_copy_us / 1000.0, prof_compute_us / 1000.0);
     }
 
     return GGML_STATUS_SUCCESS;
@@ -2074,12 +2040,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->offload_backend_id = -1;
     sched->offload_backend_min_batch = 32;
 
-    const char * GGML_SCHED_COPY_LOOKAHEAD = getenv("GGML_SCHED_COPY_LOOKAHEAD");
-    sched->copy_lookahead = GGML_SCHED_COPY_LOOKAHEAD ? atoi(GGML_SCHED_COPY_LOOKAHEAD) : 0;
-    if (sched->n_copies > 1) {
-        // the pipeline parallel path already rotates copy slots between graphs
-        sched->copy_lookahead = 0;
-    }
+    sched->copy_lookahead = 0;
 
     ggml_backend_sched_reset(sched);
 
