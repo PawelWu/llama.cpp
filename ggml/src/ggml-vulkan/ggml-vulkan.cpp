@@ -17203,11 +17203,12 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
 
     vk_buffer dev_buffer = nullptr;
     try {
-        // coherent-only: cached host memory slows down GPU-side reads on UMA (snoop overhead);
-        // keep cached as a fallback for drivers that lack an uncached host-visible type
+        // cached first: other devices stage out of these buffers through the CPU, and reads from
+        // uncached UMA memory are slow. coherent-only is the fallback for drivers without a
+        // cached host type
         dev_buffer = ggml_vk_create_buffer(ctx->device, size,
-            {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
-             vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCached | vk::MemoryPropertyFlagBits::eHostCoherent});
+            {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCached | vk::MemoryPropertyFlagBits::eHostCoherent,
+             vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
     } catch (const vk::SystemError& e) {
         GGML_LOG_WARN("ggml_vulkan: Failed to allocate host-visible buffer (%s)\n", e.what());
         return nullptr;
