@@ -1732,10 +1732,6 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         mparams.devices = params.devices.data();
     }
 
-    if (params.pp_dev != nullptr && params.pp_dev_resident) {
-        mparams.pp_dev_resident = params.pp_dev;
-    }
-
     mparams.n_gpu_layers    = params.n_gpu_layers;
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;

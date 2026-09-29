@@ -470,7 +470,6 @@ struct common_params {
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
     ggml_backend_dev_t pp_dev = nullptr;     // device that should run prefill, nullptr = disabled
-    bool pp_dev_resident = false;            // keep the weights of the layers owned by pp_dev in its VRAM
 
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors

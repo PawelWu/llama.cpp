@@ -1174,10 +1174,6 @@ struct llama_model::impl {
 
     bool has_tensor_overrides;
 
-    // overrides that keep the weights of the layers owned by params.pp_dev_resident in its own buft
-    std::vector<std::string> resident_override_strings;
-    std::vector<llama_model_tensor_buft_override> resident_overrides;
-
     std::vector<float> tensor_split_owned;
 };
 
@@ -1518,53 +1514,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
-
-    // a CPU override puts the weights of every layer into the host buffer type of the first device,
-    // so the layers assigned to the pp device would be copied to it on every prefill batch. if
-    // requested, keep the weights of exactly those layers in the pp device's own buffer type
-    if (params.pp_dev_resident != nullptr) {
-        size_t n_resident = 0;
-        for (int il = 0; il < n_layer_all; ++il) {
-            if (pimpl->dev_layer[il].dev == params.pp_dev_resident) {
-                n_resident++;
-            }
-        }
-
-        if (n_resident == 0) {
-            LLAMA_LOG_WARN("%s: no layer is assigned to device %s, no weights kept resident\n",
-                    __func__, ggml_backend_dev_name(params.pp_dev_resident));
-        } else {
-            auto * buft = ggml_backend_dev_buffer_type(params.pp_dev_resident);
-
-            // take the string pointers only after the vector is filled, they must not be invalidated
-            pimpl->resident_override_strings.clear();
-            pimpl->resident_override_strings.reserve(n_resident);
-            for (int il = 0; il < n_layer_all; ++il) {
-                if (pimpl->dev_layer[il].dev == params.pp_dev_resident) {
-                    pimpl->resident_override_strings.push_back(format("blk\\.%d\\.", il));
-                }
-            }
-
-            pimpl->resident_overrides.clear();
-            pimpl->resident_overrides.reserve(n_resident + (ml.tensor_buft_overrides != nullptr ? n_layer_all : 0) + 1);
-            for (const auto & pattern : pimpl->resident_override_strings) {
-                pimpl->resident_overrides.push_back({ pattern.c_str(), buft });
-            }
-            // the user overrides come after, so they still apply to all other tensors
-            if (ml.tensor_buft_overrides != nullptr) {
-                for (const auto * override = ml.tensor_buft_overrides; override->pattern != nullptr; ++override) {
-                    pimpl->resident_overrides.push_back(*override);
-                }
-            }
-            pimpl->resident_overrides.push_back({ nullptr, nullptr });
-
-            ml.tensor_buft_overrides  = pimpl->resident_overrides.data();
-            pimpl->has_tensor_overrides = true;
-
-            LLAMA_LOG_INFO("%s: keeping the weights of %zu layers in %s\n",
-                    __func__, n_resident, ggml_backend_buft_name(buft));
-        }
-    }
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
@@ -2816,10 +2765,9 @@ llama_model_params llama_model_default_params() {
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
-        /*.progress_callback_user_data =*/ nullptr,
-        /*.kv_overrides                =*/ nullptr,
-        /*.pp_dev_resident             =*/ nullptr,
-        /*.vocab_only                  =*/ false,
+        /*.progress_callback_user_data =*/ nullptr,        /*.kv_overrides               =*/ nullptr,
+        /*.vocab_only                 =*/ false,
+
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
