@@ -1,15 +1,56 @@
 # Handoff - `--pp-dev` (prefill on a selected device)
 
 Repo: `D:/shared/project/llama.cpp`
-Branch: `pp-custom-device` (created from `any-draft-device-fix`, based on upstream master)
-Build: `cmd //c build_pp.bat` -> `build/bin/` (MSVC + Ninja)
+Branch: `pp-host-buft` (created from `any-draft-device-fix`, based on upstream master)
+Build: `cmd //c build_pp.bat` -> `build/bin/` (MSVC + Ninja, Vulkan **and** CUDA, sm_89)
 Old chunked/streaming experiment lives on branch `pp-only-on-selected-device` (commit `a5c92af3a`), see section 10.
+Live session log with the newest numbers: `tasks.md`. This document is the longer-form reference.
 
-Status: the mechanism is implemented and measured on both models. The host-only gate is now **removed** and
-the reserve blowup that used to OOM the 6 GB dGPU is fixed (`pipeline_parallel` off when `pp_backend` is set).
-The target config `-ngl 99 --device Vulkan1 --pp-dev Vulkan0` now runs with a 177 MiB compute buffer on the
-dGPU, i.e. the streaming works and stays far under 6 GB. It is still **slower than the plain baseline on this
-machine** (section 8.3). Section 8.4 has the KV-quantized gemma A/B/C/D sweep.
+Status: **read section 0 first.** The branch moved a long way past what sections 2, 8.7 and 9.0 describe. The
+per-device host buffer type is implemented and committed, which removes the weight-reachability blocker that
+section 8.7 calls the main problem, and gives Vulkan1_Host weights with zero-copy decode. Both models are
+measured. Section 8 is still useful as raw measurement data, but its conclusions about what is impossible no
+longer hold.
+
+---
+
+## 0. Current status
+
+The important change since the earlier version of this document is the **per-device host buffer type** in
+`ggml-vulkan.cpp`:
+
+- every Vulkan device gets its own `host_buffer_type` (`VulkanN_Host`) next to `buffer_type`, created in
+  `ggml_vk_get_device` (~line 7496)
+- on UMA devices `ggml_backend_vk_device_get_host_buffer_type` (19411) returns that per-device type; discrete
+  GPUs keep the old global pinned `Vulkan_Host`
+- the per-device type reuses `ggml_backend_vk_buffer_type_name` as its `get_name`, so
+  `ggml_backend_vk_device_supports_buft` accepts it, and `is_host` is NULL so the scheduler treats it as
+  device-owned
+
+Consequences, measured on Qwen3.8-27B-MXFP4:
+
+- **8.7 is solved.** A Vulkan device can now claim host-visible weights and read them in place, which is the
+  piece 8.7 says cannot work. Weights in `Vulkan1_Host` give the best decode measured so far (TG 4.16 without
+  pp-dev, vs 3.75 for the VRAM-pinned baseline).
+- **9.0 is partly obsolete.** The pp device is still appended to `params.devices`, but the zero layer-share
+  fix in `common/common.cpp` means it no longer claims layers or KV.
+- Prefill with `--pp-dev Vulkan0` reaches PP 122-135 at 12k context, flat over the prompt, after the
+  FLASH_ATTN_EXT forced-offload fix (tasks.md SEVENTH FINDING).
+- The chunked-prefill and "weights are unreachable" analysis below is history. That reachability problem no
+  longer exists for integrated GPUs.
+
+Corrections, read these before trusting the older sections:
+
+- Section 2 lists an "Uncommitted (58 lines, 8 files)" scheduler hook. That work is committed, mostly in
+  `bf19abeb2`.
+- Section 2.1 says the `mmap_support = true` debug hunk at (then) `ggml-vulkan.cpp:19336` must be reverted.
+  It already is.
+- Section 4.2 says this build has "no CUDA backend, only Vulkan". The current build has both.
+- Section 8.10's `GGML_SCHED_COPY_LOOKAHEAD` is still in the tree but env-gated and default off. It is a
+  confirmed negative result and must be removed before any commit.
+
+Work sequence on this branch: per-device host buft -> pp-dev + FLASH_ATTN forced offload -> MTP draft on the
+MTP dGPU -> CUDA0 as pp device. The last one is closed, see section 13.
 
 ---
 
@@ -42,7 +83,8 @@ Earlier gemma-4-E4B numbers are kept in section 9 as historical reference only.
 Commit `25515e4c7` - `common : add --pp-dev to pick the prefill device` (38 lines, 3 files):
 `common/arg.cpp`, `common/common.h`, `common/common.cpp`. It only orders `params.devices`.
 
-Uncommitted (58 lines, 8 files) - the actual scheduler hook:
+Now committed (`bf19abeb2` and earlier) - the actual scheduler hook. This table described the tree as it was
+before that commit; for the current tree see section 0 and `tasks.md`:
 
 | file | change |
 |---|---|
@@ -90,9 +132,9 @@ never forced**, only prefill ubatches.
 `common/common.cpp` warns that offloaded weights are copied per prefill batch:
 `--pp-dev copies the weights of offloaded layers to the prefill device on every prefill batch`.
 
-**Extra debug hunk that must be reverted before committing**: `ggml/src/ggml-vulkan/ggml-vulkan.cpp:19336`
-has `mmap_support = true` instead of `!ctx->is_integrated_gpu` (section 8.2), and `buffer_from_host_ptr` was
-tried and reverted.
+**Extra debug hunk that used to need reverting**: `ggml/src/ggml-vulkan/ggml-vulkan.cpp` had
+`mmap_support = true` instead of `!ctx->is_integrated_gpu` (section 8.2), and `buffer_from_host_ptr` was tried
+and reverted. Both are already back to upstream state on this branch (the line is now 19444).
 
 ### 2.1 Debug hunks that MUST be reverted before committing
 
@@ -558,17 +600,17 @@ Verdict: drop the lookahead code, keep the gate and the profiling helper.
 
 ## 9. Open questions / decisions
 
-0. **Weight reachability is now the main blocker** (8.7): prefill wants weights in pinned host RAM, decode
-   wants them in Vulkan1 VRAM, and no Vulkan backend accepts `Vulkan_Host`. Best current compromise for a
-   prefill-heavy workload is D8 ub2048 (123 t/s PP, 1.71 t/s TG); for a decode-heavy workload, config A
-   (58.8 / 3.75).
+0. **RESOLVED - weight reachability was the main blocker** (8.7). A Vulkan device can now claim host-visible
+   weights through the per-device host buft and read them in place, so there is no longer a choice between a
+   fast-prefill placement and a fast-decode placement. Weights in `Vulkan1_Host` give PP 122-135 with
+   `--pp-dev Vulkan0` and TG 4.16 without it. Sections 8.7 and 8.9 keep the old workarounds (D8 ub2048 at
+   123 / 1.71, config A at 58.8 / 3.75) as history only.
 
-   `common/common.cpp` appends the pp device to `params.devices`, which feeds the layer split in
-   `src/llama-model.cpp:1425-1490` and silently moves ~13 layers (2744 MiB) plus 64 MiB of KV to the pp
-   device. That is why `-ngl 99 --pp-dev Vulkan0` looks faster (64.6 t/s) than the honest variant that keeps
-   every weight on the iGPU (26.8 t/s). The pp backend should be added to the scheduler backend list only
-   (`src/llama-context.cpp:426-448`), not to the model device list. `-ot ".*=Vulkan1"` is the current
-   workaround for testing.
+   Still true: `common/common.cpp` appends the pp device to `params.devices`, which feeds the layer split in
+   `src/llama-model.cpp:1425-1490`. The zero layer-share fix (`tensor_split` [1,0] when the pp device was
+   appended and `-ts` was not given) stops it claiming layers, KV and decode norm ops. Whether the pp device
+   should instead join the scheduler backend list only (`src/llama-context.cpp:426-448`) and never the model
+   device list is still an open design question.
 2. Flash-attention resolution: `resolve_fused_ops()` (`src/llama-context.cpp:529`) disables FA when the
    forced matmuls drag the fused node to another device. Workaround `-fa on`. Unresolved.
 3. Is `ggml_backend_sched_set_offload_backend()` the right public API shape, or should `pp_backend` be
@@ -622,3 +664,384 @@ slower because the AI-serving `llama-server.exe` held ~5.5 GB of the 6 GB dGPU. 
 - `ggml/src/ggml-vulkan/ggml-vulkan.cpp` - `ggml_backend_vk_host_buffer_type()`,
   `ggml_vk_get_op_batch_size()`, `op_offload_min_batch_size`, `ggml_vk_buffer_copy()` MULTI_DEVICE path
   (~9113-9136), `ggml_backend_vk_buffer_cpy_tensor()` (~17051)
+
+---
+
+## 13. CUDA0 as pp device (closed)
+
+Goal: drive the dGPU through CUDA instead of Vulkan for prefill. Measured CUDA0 PP 74 t/s against Vulkan0
+PP 135 t/s on the same 12k prompt, so the direction does not pay off on this hardware.
+
+The gap is the copy path, not the kernels. For every weight tensor copied `Vulkan1_Host` -> CUDA0, the
+scheduler calls the destination backend's `cpy_tensor_async` first (`ggml-backend.cpp:1890`).
+`ggml_backend_cuda_cpy_tensor_async` (`ggml-cuda.cu:2477`) returns false unless both sides are CUDA (line
+2481), so a Vulkan source can never use it. The fallback synchronizes the Vulkan source and the CUDA
+destination, then does a blocking `ggml_backend_tensor_copy`, which lands on
+`ggml_backend_cuda_buffer_cpy_tensor` (`ggml-cuda.cu:820`) - also CUDA-source-only - and finally on the
+`malloc` + `get_tensor` + `set_tensor` path (`ggml-backend.cpp:503-507`). That is two backend syncs, a
+malloc, a CPU read of the mapped host buffer, and a pageable H2D copy, per weight, all serialized, about
+1500 times per ubatch.
+
+Vulkan0 avoids all of it because the destination is Vulkan, so `ggml_backend_vk_buffer_cpy_tensor`
+(`ggml-vulkan.cpp:17103`) takes the `is_vk(src)` branch and the copy becomes a MULTI_DEVICE GPU staging copy
+with no malloc and no pageable H2D.
+
+The blocker for closing the gap: vk tensors have a fake base (`vk_ptr_base = 0x1000`) and the real address is
+`ggml_backend_vk_buffer_context::dev_buffer->ptr`. No interface lets a foreign backend ask for it, so CUDA
+cannot DMA from the weights.
+
+| option | what it needs | verdict |
+|---|---|---|
+| A | expose the real host pointer (new optional buffer accessor) + `cudaHostRegister` + a CUDA copy entry point that accepts a non-CUDA source | the only route that can beat 135, needs an upstream issue, not implemented |
+| B | weights in `cudaMallocHost`, imported into Vulkan via `VK_EXT_external_memory_host` | blocked, the AMD driver rejects host-memory imports (8.2) |
+| C | keep Vulkan0 as the pp device | chosen, already 1.8x faster |
+
+CUDA0 results for the record: first run 51.9 t/s (uncached host reads), after the `ggml_vk_buffer_read_2d`
+staging detour plus cached-first host memory it reached 74.0 t/s, with the Vulkan arm unchanged (132.5 /
+4.63 vs 134.9 / 4.76, noise). `GGML_CUDA_NO_PINNED=1` was noted as possibly relevant for mixed Vulkan+CUDA
+and was never needed.
+
+---
+
+## 14. Audit and hygiene
+
+`ggml_backend_buffer_is_vk` now also matches the per-device host buffers, because they reuse the `get_name`
+function pointer on purpose. Every caller stays correct: the buffer `cpy_tensor` (17103) and
+`cpy_tensor_async` (17470) only use `bufctx->dev_buffer` plus buffer-relative offsets, and the rest are
+inside `GGML_VULKAN_CHECK_RESULTS`, which is off. This is also what enables the Vulkan1_Host -> V0 staging
+copy.
+
+`get_base()` consumers, all safe: `llama-context.cpp:2172` (output_reserve) and
+`llama-model-loader.cpp:1560` (async-upload staging) are guarded with `ggml_backend_buft_is_host`;
+`llama-model.cpp:1781` (mlock) requires `ggml_backend_buffer_is_host`, which is false for the new buft, so it
+is skipped by construction; the `no_alloc` asserts at `llama-model.cpp:1909` and `llama-kv-cache.cpp:691`
+already fail for any vk buffer, so they are pre-existing.
+
+Branch hygiene: local artifacts (session html, `.pi/continue/`, `pp_chunked_*.md`, `prompt*.txt`,
+`test_decode_results.txt`, the `test_pp_*` results and scripts) were unstaged and left untracked, and the
+stray `nul` file was deleted. `tasks.md` and `handoff.md` stay tracked.
+
+---
+
+## 15. ubatch 4096 crash (Qwen3.8 / QWEN35)
+
+Large ubatches are the main prefill lever (weights stream once per ubatch, so per-token copy volume falls
+as ub rises), but this model cannot go past 3072.
+
+| ub | result (Qwen3.8-27B Q4_K_XL, -c 5000, q4_1 KV, MTP on V0) |
+|---|---|
+| 2048 | OK, Prompt 120.2 |
+| 3072 | OK, Prompt 131.5 |
+| 3840 | SEGFAULT (exit 139) |
+| 4096 | SEGFAULT (exit 139) |
+
+gemma-4-E4B at ub=4096 is fine, so it is QWEN35-specific, not a general limit. It is also independent of
+`--pp-dev`, of the host buft and of weight placement (it reproduces with plain `-dev Vulkan1 -ngl 99`), so
+it is not caused by this branch. It dies inside `sched_reserve` -> `resolve_fused_ops` -> the DeepSeek V4 HC
+probe -> `graph_reserve(1, ...)`, silently, with no error line.
+
+It is NOT a memory-bandwidth wall: at ub=4096 the streamed weights are 15.8 GB per ubatch, i.e. about
+3.9 MB/token, which is roughly 0.5% of DDR5-5600 dual-channel bandwidth. A bandwidth limit would show as
+low throughput, not a segfault.
+
+Suspect but unproven: `graph_max_nodes` gives QWEN35 `n_tokens * 40` nodes and the KIMI_K3 branch above it
+documents that exact budget as exhausted at ubatch 3840, but a linear node requirement cannot produce a
+threshold-only failure, so something else is likely. Needs a stack trace. Practical ceiling: ub=3072.
+
+---
+
+## 16. Easy wins / pre-commit cleanup
+
+Do these before committing, and before merging upstream (section 16.8).
+
+Ground rules, read these first:
+
+- Line numbers below are from 2026-09-26, HEAD `bf19abeb2` plus one uncommitted comment change in
+  `ggml-vulkan.cpp`. They WILL drift as you edit. Always locate by the quoted anchor string, never by line
+  number alone: `grep -n "<anchor>" <file>` first, then edit.
+- Rebuild after each item: `cmd //c build_pp.bat`. Do not batch all the edits and build once, or you will
+  not know which edit broke the build.
+- Before building, stop anything holding the DLLs: `taskkill /F /IM llama-server.exe /T` and confirm with
+  `cmd //c tasklist | grep -i llama` that no `llama-cli.exe` is left. A running process holds
+  `build/bin/ggml-vulkan.dll` open and the link then fails with
+  `LINK : fatal error LNK1104: cannot open file 'bin\ggml-vulkan.dll'`. That is a FILE LOCK, not a code
+  error. Do not go hunting for a code bug when you see it.
+
+WHAT NOT TO REVERT - this is the feature, keep all of it:
+
+- `ggml/src/ggml-vulkan/ggml-vulkan.cpp`: per-device host buft, the two multi-device copy changes, cached-first memory
+- `common/common.cpp`: pp_dev append, zero layer share, the "copies the weights" warning
+- `common/common.h`: the `pp_dev` field
+- `common/arg.cpp`: the `--pp-dev` argument PARSING (only its help text changes, item 16.1)
+- `ggml/include/ggml-backend.h`: `ggml_backend_sched_set_offload_backend` declaration
+- `include/llama.h`, `src/llama-cparams.h`, `src/llama-context.h`: the `pp_backend` plumbing
+- `src/llama-context.cpp`: `sched_set_pp_backend()`, the `output_reserve` host guard, the pipeline_parallel guard
+- `src/llama-model-loader.cpp`: the async-upload host buft guard
+- `ggml/src/ggml-backend.cpp`: `ggml_backend_sched_op_batch_size()`, the FLASH_ATTN forced-offload block, the
+  weight forced-offload block, `offload_backend_id` / `offload_backend_min_batch`, `set_offload_backend`
+
+### 16.1 The `--pp-dev` help text recommends a 100x slowdown (do this first)
+
+Why: `common/arg.cpp` currently advises setting `GGML_OP_OFFLOAD_MIN_BATCH=1` to move decode onto a GPU.
+That advice is measurably wrong. With it, decode streams the entire 14.5 GB model through the compute
+buffer on EVERY token: measured TG 0.72 t/s against 1.52 t/s without it (tasks.md D9, handoff 8.7). It
+already damaged a real-work run - the user saw 200+ MB PCIe bursts and iGPU at 80% during decode (tasks.md
+"User's real-work observation"). Users read that text and trust it.
+
+Anchor: `set GGML_OP_OFFLOAD_MIN_BATCH=1 (decode then uses the first GPU in the device list)`
+
+Exact current code (`common/arg.cpp`, inside the `add_opt(common_arg({"--pp-dev"}, "DEVICE", ...))` call,
+about line 2786):
+
+```cpp
+    add_opt(common_arg(
+        {"--pp-dev"}, "DEVICE",
+        "device that should run prefill (e.g. CUDA0)\n"
+        "weight ops of prefill batches (batch size >= 32) run on it,\n"
+        "the weights are copied to this device on every such batch, wherever they are stored\n"
+        "decode (n_tokens = 1) is not affected; to also run decode on a GPU,\n"
+        "set GGML_OP_OFFLOAD_MIN_BATCH=1 (decode then uses the first GPU in the device list)",
+```
+
+Exact replacement:
+
+```cpp
+    add_opt(common_arg(
+        {"--pp-dev"}, "DEVICE",
+        "device that should run prefill (e.g. CUDA0)\n"
+        "weight ops of prefill batches (batch size >= 32) run on it,\n"
+        "the weights are copied to this device on every such batch, wherever they are stored\n"
+        "decode (n_tokens = 1) is not affected",
+```
+
+Two details that will trip you up: the consecutive string literals are ONE argument (C++ concatenation),
+and the trailing comma after the last literal must STAY, because it separates the description argument
+from the `[](common_params & params, const std::string & value)` lambda that follows.
+
+Difficulty: trivial. Risk: none, help text only.
+Verify: `build/bin/llama-cli.exe --help`, find the `--pp-dev` block; `MIN_BATCH` must not appear.
+
+### 16.2 Revert the temporary `#if 1` cause dump
+
+Why: the branch flips an upstream `#if 0` to `#if 1` to enable the `SET_CAUSE` assignment dump. That
+allocates a large static array and is not meant to ship. The in-code comment says "revert before
+committing"; that is not decoration.
+
+Anchor: `#if 1 // DEBUG: temporary, revert before committing`
+
+Change that one line to:
+
+```cpp
+#if 0
+```
+
+Everything between that `#if` and the matching `#else` / `#endif` stays exactly as upstream has it. Do not
+delete the block.
+
+Difficulty: trivial. Risk: none.
+Verify: `grep -n "DEBUG: temporary" ggml/src/ggml-backend.cpp` returns nothing, and the tree builds.
+
+### 16.3 Revert the widened assignment-dump format strings
+
+Why: two format strings were widened so that `Vulkan0` and `1.off_forced` are not truncated in the trace
+dump. Useful locally, but a debug-only change that should not ship.
+
+Anchor 1: `[%-12s %-14s] use=%d,c=%d:` (the node line)
+Anchor 2: `(%5.5s) [%-12s %-14s]` (the `src` variant inside the same `for (int j = 0; ...)` loop)
+
+Both are in `ggml_backend_sched_print_assignments` in `ggml/src/ggml-backend.cpp`, about lines 1062 and
+1071. Restore the upstream widths `[%5.5s %8.8s]` in both places. Nothing else on those lines changes.
+
+WARNING before you revert: `%5.5s` truncates to 5 characters, which is exactly why the widening existed.
+Section 8.5 records that this truncation "cost a wrong conclusion once already" - weight copy names such as
+`Vulkan0#blk.0.attn_q#0` were being cut off. If you need to read the assignment dump again, re-widen it
+locally; do not leave it widened in the commit.
+
+Difficulty: trivial. Risk: none to behaviour, small to future debugging (see warning).
+Verify: `grep -n -- "%-12s\|%-14s" ggml/src/ggml-backend.cpp` returns nothing.
+
+### 16.4 Remove the `GGML_SCHED_PROFILE` footgun
+
+Why: this is an env-gated timer added for the copy/compute attribution work. It is worse than dead code:
+it calls `ggml_backend_synchronize()` after every copy and after every split. If it is ever left on it
+silently serializes the scheduler and destroys every timing you take. This already happened - a real-work
+run had it set and the numbers were skewed (tasks.md "User's real-work observation"). It also writes to
+`stderr` with `fprintf`, so `--log-file` does not capture it and you lose the output without noticing.
+
+Note the docs disagree: section 8.10 says "keep ... the profiling helper", tasks.md Phase 3 says remove it.
+REMOVE IT. Its output is already recorded in this document and in tasks.md. Keeping a footgun for a
+measurement you have already taken is a bad trade.
+
+Removal is mechanical. Find every reference with:
+
+```sh
+grep -n "prof\|GGML_SCHED_PROFILE" ggml/src/ggml-backend.cpp
+```
+
+As of 2026-09-26 that returns exactly these, all of which go:
+
+| line | what to remove |
+|---|---|
+| 1723-1726 | `ggml_backend_sched_profile_enabled()` - the whole function |
+| 1732-1736 | `const bool prof` and the four `prof_*` accumulators |
+| 1771 | `const int64_t prof_t0 = ...` |
+| 1904-1911 | the `if (prof) { ... }` block that runs after a copy |
+| 1932 | `const int64_t prof_t1 = ...` |
+| 1975 | `prof_compute_us += ...` (inside an `if (prof)`) |
+| 1998-2002 | the final `if (prof) { fprintf(stderr, "sched_profile: ...") }` block |
+
+Difficulty: mechanical, several sites. Risk: low.
+Verify: `grep -n "prof" ggml/src/ggml-backend.cpp` returns nothing, and the tree builds with no new warnings.
+
+### 16.5 `copy_lookahead` - READ THIS ONE CAREFULLY, IT IS NOT A DELETE
+
+Why: `GGML_SCHED_COPY_LOOKAHEAD` prefetches weight copies ahead of the splits that consume them. It is a
+confirmed negative result on this hardware (section 8.10: the RTX 4050 reports `single_queue = true`, so
+copy and compute share one FIFO and cannot overlap), and worse, it is a CORRECTNESS hazard: enabling it
+produced garbage logits and an assert in `llama-sampler.cpp:1211` (tasks.md: "copy_lookahead test: PP 81.5
+but crash at first decode").
+
+Why it is not a delete: the change is NOT purely additive. To support prefetching, the branch RESTRUCTURED
+`ggml_backend_sched_compute_splits` - the per-split body was extracted into a `copy_split_inputs` lambda,
+`is_weight` / `weights_only` / `prefetched` skip logic was added, and upstream code was REMOVED: the
+`if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id)` sync guard at
+the top of the old loop is gone. If you "just delete the lookahead blocks" you leave the restructured,
+unreviewed version of the scheduler hot path in place, minus the thing that motivated the restructure.
+
+So do it in two tiers.
+
+TIER 1 - kill the footgun now, cheaply and reversibly.
+
+Delete the env var read so the feature can never be enabled. Anchor: `GGML_SCHED_COPY_LOOKAHEAD`
+(`ggml/src/ggml-backend.cpp`, about lines 2077-2081):
+
+```cpp
+    const char * GGML_SCHED_COPY_LOOKAHEAD = getenv("GGML_SCHED_COPY_LOOKAHEAD");
+    sched->copy_lookahead = GGML_SCHED_COPY_LOOKAHEAD ? atoi(GGML_SCHED_COPY_LOOKAHEAD) : 0;
+    if (sched->n_copies > 1) {
+        // the pipeline parallel path already rotates copy slots between graphs
+        sched->copy_lookahead = 0;
+    }
+```
+
+Replace that whole block with just:
+
+```cpp
+    sched->copy_lookahead = 0;
+```
+
+Behaviour is then upstream-identical: every `if (lookahead > 0)` and `if (sched->copy_lookahead > 0)`
+branch is unreachable, so both the broken prefetch path and the garbage-logits bug cannot trigger.
+
+Verify tier 1: re-run any config that worked before and confirm identical output and t/s. Then prove the
+feature is unreachable: `GGML_SCHED_COPY_LOOKAHEAD=8 build/bin/llama-cli.exe ...` must now behave exactly
+the same as without the variable (before this change it crashed at the first decode).
+
+TIER 2 - the real cleanup, needed for any commit or PR.
+
+Remove the whole feature: the `int copy_lookahead;` struct field (about line 835), the
+`if (sched->copy_lookahead > 0 && sched->n_copies == 1) { ... }` block in `ggml_backend_sched_split_graph`
+(about lines 1507-1541), and restore `ggml_backend_sched_compute_splits` to the upstream, un-lambda'd
+structure INCLUDING the removed `prev_backend_id` sync guard.
+
+Because this reverses a restructure rather than deleting additions, the reliable procedure is:
+
+```sh
+git diff b1cb4909c..HEAD -- ggml/src/ggml-backend.cpp   # read this first, know what you are reversing
+git checkout b1cb4909c -- ggml/src/ggml-backend.cpp     # reset this one file to upstream
+```
+
+then re-apply ONLY these feature hunks to `ggml-backend.cpp` (everything else in the file should now be
+upstream):
+
+1. the two struct fields `int offload_backend_id;` and `int offload_backend_min_batch;`
+2. nothing for the `#if`: it stays `#if 0`, do not re-apply the debug flip
+3. `ggml_backend_sched_op_batch_size()`
+4. the FLASH_ATTN_EXT forced-offload block in `ggml_backend_sched_backend_id_from_cur`
+   (`SET_CAUSE(tensor, "1.off_fa")`)
+5. the weight forced-offload block in the same function (`SET_CAUSE(tensor, "1.off_forced")`, with the
+   `offload_backend_min_batch` gate)
+6. the `op_offload`, `offload_backend_id = -1`, `offload_backend_min_batch = 32` initialisation in
+   `ggml_backend_sched_new`
+7. `ggml_backend_sched_set_offload_backend()`
+
+Do NOT re-apply the widened print formats (16.3) or any `prof` code (16.4).
+
+Verify tier 2 the hard way, because this file is the scheduler hot path. Rebuild, then re-run a config that
+does NOT use `--pp-dev` at all and confirm throughput matches a pre-change run - the lambda refactor
+touched the non-pp-dev path too. Only then re-run `-dev Vulkan1 -ngl 99 -ot ".*=CPU" --load-mode none
+--pp-dev Vulkan0` and confirm prefill is still about 131 t/s at ub=3072.
+
+Difficulty: tier 1 easy, tier 2 moderate and easy to get wrong.
+Risk: tier 2 touches the hot path. Do it on its own, with a before/after number, not bundled with other edits.
+
+### 16.6 `bench_copy.cpp` is committed and should not be
+
+Why: `bench_copy.cpp` (216 lines, repo root) is the local two-GPU copy microbenchmark from section 8.6. It
+is tracked on this branch - `git diff b1cb4909c..HEAD --stat` lists it - and has no business in a commit.
+
+```sh
+git rm --cached bench_copy.cpp   # keeps the file on disk, removes it from the index
+```
+
+Consider `build_bench.bat` too. Note `*.bat` is already in `.gitignore` so the bat files are untracked
+automatically; `bench_copy.cpp` is not covered.
+
+Same judgement call, same category: `handoff.md` (624 lines) and `tasks.md` (508 lines) are also committed.
+They are session logs. That is fine on a private working branch and wrong in a PR. Decide deliberately. If
+you drop them from the commit, the PR description has to be written by the human author, not by an agent.
+
+### 16.7 Suggested order, and the one structural warning
+
+Order: 16.1, 16.2, 16.3, 16.4, 16.6, then 16.5 tier 1, then rebuild and take a baseline number, then 16.5
+tier 2 last and alone. Rebuild and sanity-check after each item.
+
+The one warning that matters: 16.5 tier 2 is the only item here that REVERSES upstream code rather than
+adding to it. Everything else is additive, or a literal revert of an additive change. Treat tier 2 as a
+separate verified change with a before/after measurement, or skip it entirely and keep tier 1.
+
+### 16.8 Upstream pull - status and prerequisites
+
+As of 2026-09-26:
+
+- Remotes are `origin` = `github.com/PawelWu/llama.cpp` (your fork) and `rocm` = a local path. There is NO
+  `ggml-org` or `upstream` remote, even though the base commit message says "Merge branch
+  'ggml-org:master'". Adding it is a prerequisite.
+- The base is `b1cb4909c`, dated 2026-09-09. That is about 17 days behind, on a repo that merges thousands
+  of PRs.
+- Local `master` tracks `origin/master`, which shows `[gone]`, so the fork's remote layout changed too.
+
+Why pulling is worth it: `llama_context::graph_max_nodes` (`src/llama-context.cpp:2351`) is under active
+upstream tuning for exactly these hybrid architectures. `LLM_ARCH_KIMI_K3` was pulled out into its own
+branch using `n_tokens * 160`, with the comment "the n_tokens*40 budget below is exhausted at ubatch 3840",
+while `LLM_ARCH_QWEN35` still sits in the `*40` branch that the comment warns about. Our measured crash
+threshold for QWEN35 is between ub=3072 and ub=3840 - the same place. Newer upstream may already contain a
+fix, so pulling is the cheapest way to test that hypothesis.
+
+Do it like this, NOT on `pp-host-buft`:
+
+```sh
+git remote add upstream https://github.com/ggml-org/llama.cpp
+git fetch upstream master
+git switch -c upstream-trial pp-host-buft     # scratch branch, leaves pp-host-buft untouched
+git merge upstream/master                      # observe conflicts, do not resolve blindly
+```
+
+Prerequisite: deal with `51a2708e1 wip - GLM 5.3 improvements` first. Merging upstream on top of an
+unexplained WIP commit produces a merge nobody can reason about.
+
+Fragility to check after ANY merge - these are what the feature depends on, and they fail SILENTLY:
+
+- `ggml_backend_vk_device_supports_buft` (`ggml-vulkan.cpp`) must still compare the `get_name` function
+  POINTER against `ggml_backend_vk_buffer_type_name`. The per-device host buft reuses that function in
+  order to be accepted. If upstream rewrites this check, the host buft stops being claimed and decode
+  silently loses zero-copy, falling back to CPU-owned weights.
+- `is_host` must stay NULL on `ggml_backend_vk_host_buffer_type_interface`. Setting it to the CPU buft's
+  value brings back the loader `ReadFile` crash (FOURTH FINDING).
+- the three `get_base()` guards must survive: `output_reserve` (`src/llama-context.cpp`), the async-upload
+  staging path (`src/llama-model-loader.cpp`), and the CPU-backend pairing.
+- `llama_context::graph_max_nodes` - if upstream changes it, recheck whether ub>=3840 starts working.
+
+Acceptance test for the merge: the gemma case A/B regression (section 8.4), then
+`-dev Vulkan1 -ngl 99 -ot ".*=CPU" --load-mode none --pp-dev Vulkan0` on the 27B must still give about
+131 t/s prefill at ub=3072 with zero-copy decode.

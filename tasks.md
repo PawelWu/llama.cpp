@@ -482,19 +482,42 @@ and could push PP well past 150.
 
 ### BACKLOG (user requests)
 
-1. CUDA0 as the prefill device. The mechanism is backend-agnostic (sched_set_offload_backend takes
-   any backend; CUDA reports a CPU-addressable pinned host buft so all the is_host guards behave
-   like upstream). Expected: PP weight copies ride the generic scheduler copy path
-   (sysmem -> CUDA pinned staging -> H2D DMA, typically 6-10 GB/s) instead of the V0 staging round
-   trip - possibly faster than Vulkan0. Watch: mixed Vulkan+CUDA driver state in one process,
-   GGML_CUDA_NO_PINNED=1 may become relevant again. Try after the feature is proven complete
-   on Vulkan. Needs a CUDA build of the same tree (current build is Vulkan-only).
+1. CUDA0 as the prefill device - CLOSED, see "CUDA0 as pp device: closed" below. Hypothesis was
+   that the weight copies would ride the generic scheduler path (sysmem -> CUDA staging -> H2D DMA)
+   instead of the Vulkan0 staging round trip, and come out faster. Measured: 74.0 vs 132.5-134.9
+   t/s. It does not. Vulkan0 stays.
 2. MTP-on-dGPU as the standard layout (matches the user's normal 27B dense setup: iGPU = main
    device, dGPU = MTP draft / DSpark when adventurous). Current optimal.bat already does this via
    --spec-draft-device Vulkan0. Validate the MTP+pp-dev combination end-to-end (draft graph and
    verify graph interplay with the forced-offload, esp. that verify stays on V1 with default
    MIN_BATCH=32), then check DSpark compatibility. Done for MTP in the real-work log: draft
    graphs were the small 15-split ones, healthy; only verify was distorted by MIN_BATCH=1.
+
+### CUDA0 as pp device (backlog item 1, first results)
+
+Tree rebuilt Vulkan+CUDA (user's flags, sm_89, configure_pp.bat). MTP A/B via llama-cli
+(ab_on/ab_off.log, 353 tok, n=128, draft on V0): PP 43.5/43.5, TG 6.40 (MIN_BATCH=1) vs 6.63
+(default) -> default wins, MTP healthy, +59% over no-spec 4.16. 12k ctx config B: PP 134.9,
+TG 4.76. User's real-work 2.51 TG was MIN_BATCH=1 (verify on V0, KV streamed over PCIe) plus
+GGML_SCHED_PROFILE=1; optimal.bat fixed.
+
+CUDA0 pp-dev results, Qwen 12k prompt:
+- first run (coherent-only V1_Host): PP 51.9 t/s, TG 3.35. Copy path = generic sched copy ->
+  get_tensor on the V1_Host buffer -> CPU read of UNCACHED UMA sysmem (the FIFTH-finding trap in
+  a new place; with a Vulkan pp dev the copies never CPU-read).
+- fix: ggml_vk_buffer_read_2d routes reads > 16 MiB from uncached host-visible UMA memory
+  through the GPU staging (device copy to cached staging, then CPU memcpy from cached).
+- host buft flipped back to cached-first (HOST_CACHED|HOST_COHERENT preferred, coherent-only
+  fallback): CUDA0 PP 74.0, Vulkan arm unchanged (PP 132.5 / TG 4.63 vs 134.9/4.76 = noise).
+  Cached-first kept: strictly better for cross-device copies, no Vulkan cost. NOTE: with cached
+  memory the >16MiB staging detour in buffer_read_2d is bypassed (memory IS cached -> direct
+  memcpy at DRAM speed), so the two changes compose correctly.
+- copy_lookahead test: PP 81.5 but crash at first decode (llama-sampler.cpp:1211 assert, garbage
+  probs -> lookahead produces wrong logits). Confirms handoff 8.10: stays env-gated OFF.
+
+Superseded by the close-out below: the 74 vs 135 gap was diagnosed as a copy-path problem, and the
+direction was closed because the only real fix is a new cross-backend contract that Vulkan0 does
+not need.
 
 ### User's real-work observation (llama-atest.log, resolved)
 
@@ -505,4 +528,140 @@ verify graph ping-ponged and streamed KV over PCIe (user saw 200+ MB bursts in H
 dGPU 20% during decode). GGML_SCHED_PROFILE=1 was also on in a real-work run (serializes, skews).
 Fix: drop both env vars - captured in optimal.bat (project root). Everything else in the user's
 bat was already correct.
+
+### CUDA0 as pp device: closed
+
+The gap (CUDA0 PP 74, Vulkan0 PP 135) is not a kernel issue, it is the copy path. Per weight tensor
+copied Vulkan1_Host -> CUDA0 in `ggml_backend_sched_compute_splits`:
+
+1. the dst backend's `cpy_tensor_async` is tried first (ggml-backend.cpp:1890).
+   `ggml_backend_cuda_cpy_tensor_async` (ggml-cuda.cu:2477) returns false unless BOTH sides are CUDA
+   (line 2481), so a Vulkan source can never use it.
+2. fallback (ggml-backend.cpp:1891-1899): synchronize the Vulkan source, then synchronize or wait on
+   the CUDA destination, then a blocking `ggml_backend_tensor_copy`.
+3. `ggml_backend_tensor_copy` (ggml-backend.cpp:488) sees neither side as host (`is_host` is NULL on
+   the per-device host buft by design), so it calls `ggml_backend_buffer_copy_tensor` ->
+   `ggml_backend_cuda_buffer_cpy_tensor` (ggml-cuda.cu:820), which also requires a CUDA source and
+   returns false.
+4. last resort (ggml-backend.cpp:503-507): `malloc(8.7 MiB)` + `ggml_backend_tensor_get` (Vulkan
+   reads the mapped host buffer on the CPU) + `ggml_backend_tensor_set` (cudaMemcpyAsync H2D from
+   pageable malloc memory, then cudaStreamSynchronize).
+
+So each of ~1500 weights per ubatch pays two backend syncs, a malloc, a CPU read and a pageable H2D
+copy, all serialized.
+
+Why Vulkan0 does not have this: there the destination is Vulkan, so
+`ggml_backend_vk_buffer_cpy_tensor` (ggml-vulkan.cpp:17103) takes the `is_vk(src)` branch. The
+per-device host buft reuses `ggml_backend_vk_buffer_type_name` as `get_name`, so a Vulkan1_Host
+source IS a vk buffer and the copy becomes `ggml_vk_buffer_copy` MULTI_DEVICE staging (GPU copy to
+staging, CPU staging-to-staging memcpy, V0 DMA write). No malloc, no pageable H2D, no cross-backend
+serialize.
+
+Root blocker: vk tensors have a fake base (`vk_ptr_base = 0x1000`); the real address lives in
+`ggml_backend_vk_buffer_context::dev_buffer->ptr`. No interface lets a foreign backend ask for it, so
+CUDA cannot DMA from the weights.
+
+Measured comparison, Qwen3.8-27B MXFP4, 12k prompt, q4_1 KV, fa:
+
+| metric | CUDA0 | Vulkan0 |
+|---|---|---|
+| PP t/s | 74.0 best (51.9 with coherent-only host memory) | 132.5-134.9 |
+| weight copy per tensor | 2 backend syncs + malloc + CPU read + pageable H2D, serialized | GPU staging copy, no malloc, no pageable H2D |
+
+Reasons the direction is closed, in order of weight:
+
+1. It is already 1.8x slower on the metric it was meant to win. Nothing in the diagnosis suggests a
+   cheap change that recovers that.
+2. The only real fix is invasive. (A) below needs a new optional accessor on the shared buffer
+   interface, a `cudaHostRegister` on a Vulkan-owned allocation, and a CUDA copy entry point that
+   accepts a foreign source. That is a new cross-backend contract spread over
+   ggml-backend-impl.h + ggml-cuda.cu + ggml-vulkan.cpp. Per AGENTS.md it needs a prior issue, and the
+   case for it is weak while the Vulkan path already works.
+3. The upside is bounded. Pinning removes the staging and the CPU touch, and CUDA's separate copy
+   engine makes real overlap possible where Vulkan is single-queue on this card (8.10) - but 15.8 GB
+   per ubatch still has to cross PCIe. Best case it trades an invasive rework for roughly what Vulkan0
+   already delivers.
+4. The original goal is already met: zero-copy decode on the iGPU plus 131.5 t/s prefill.
+
+Alternatives considered, kept as the record rather than as pending work:
+
+- (A) expose the real host pointer: new optional buffer accessor implemented by the vk host buft, plus
+  `cudaHostRegister` on the mapped allocation, plus a CUDA copy entry point accepting a non-CUDA
+  source. This was the only route that could beat 135 t/s. Not implemented.
+- (B) pin the weights with cudaMallocHost and import into Vulkan via VK_EXT_external_memory_host.
+  BLOCKED by hardware: the AMD driver rejects host-memory imports (handoff 8.2,
+  ErrorInvalidExternalHandle).
+
+Revisit only if CUDA is wanted for a capability reason (a quant type or op that Vulkan lacks) rather
+than for throughput. Note the ub>=3840 crash is device-independent, so CUDA0 would also be capped at
+ub=3072 for this model even if (A) were done.
+
+### Audit: is_vk callers and get_base consumers (clean)
+
+`ggml_backend_buffer_is_vk` now also matches the per-device host buffers (it compares the `get_name`
+function pointer, which they reuse on purpose). All callers stay correct: the buffer cpy_tensor
+(ggml-vulkan.cpp:17103) and cpy_tensor_async (17470) only use `bufctx->dev_buffer` and
+buffer-relative offsets, and every other caller is inside GGML_VULKAN_CHECK_RESULTS, which is off.
+The new behavior is a win: it is what enables the Vulkan1_Host -> V0 staging copy in the first place,
+and it also gives same-device HOST_VISIBLE -> device copies the async vk copy path.
+
+get_base consumers, all safe:
+- `llama-context.cpp:2172` output_reserve: guarded by `ggml_backend_buft_is_host`, so logits fall back
+  to the plain CPU buffer (the FOURTH FINDING fix).
+- `llama-model-loader.cpp:1560` async-upload staging: guarded, so async uploads are skipped.
+- `llama-model.cpp:1781` mlock: requires `ggml_backend_buffer_is_host`, which is false for the new
+  buft, so mlock is skipped. Safe by construction, no change needed.
+- `llama-model.cpp:1909` / `llama-kv-cache.cpp:691` (the `no_alloc` assert base == nullptr): these
+  compare against `vk_ptr_base` for any vk buffer, so they are pre-existing behavior for Vulkan
+  device bufts too, not introduced here.
+
+### Branch hygiene (done)
+
+The tree had a large number of local artifacts accidentally staged. Unstaged (left on disk as
+untracked): the session html, `.pi/continue/*`, `pp_chunked_*.md`, `pp_debug_next_steps.md`, the
+`prompt*.txt` / `test_prompt.txt` inputs, `test_decode_results.txt` and the `test_pp_*` results and
+scripts. Removed the stray `nul` file. `tasks.md` and `handoff.md` stay tracked. The only tracked
+change now is a comment fix in ggml-vulkan.cpp (see below).
+
+The cached-first A/B note-to-self in `ggml_backend_vk_host_buffer_type_alloc_buffer` was replaced by a
+statement of the decision and the reason. The coherent-only arm stays as the driver fallback, so the
+`uncached_uma` staging detour in `ggml_vk_buffer_read_2d` is NOT dead code - it exists for drivers
+without a cached host type.
+
+### ub=4096 crash (Qwen3.8 / QWEN35): graph reservation, QWEN35-specific
+
+The sweep's b4096/ub4096 rows are missing because the process segfaults (exit 139) during
+`sched_reserve`, before any buffer-size line is printed. Reproduced with `-fit off`, and with every
+weight placement (device buft, Vulkan1_Host, with and without `--pp-dev`), so it is not caused by the
+pp-dev feature.
+
+Measured threshold, Qwen3.8-27B Q4_K_XL, `-c 5000`, q4_1 KV, `-fa on`, MTP on V0 (sweep config):
+
+| ub | result |
+|---|---|
+| 512 | OK, Prompt 75.5 (sweep) |
+| 1024 | OK, Prompt 106.1 (sweep) |
+| 2048 | OK, Prompt 120.2 |
+| 3072 | OK, Prompt 131.5 |
+| 3840 | SEGFAULT (139) |
+| 4096 | SEGFAULT (139) |
+
+Control: gemma-4-E4B at ub=4096 runs fine (Prompt 323.3, exit 0), so this is QWEN35-specific and not a
+general ubatch limit.
+
+Crash location: `sched_reserve` -> `resolve_fused_ops` (llama-context.cpp:665) -> the DeepSeek V4 HC
+probe -> `graph_reserve(1, 1, 1, mctx, true)`. The last logged line is the probe's graph reserve, then
+the process dies with no error message, which fits an out-of-bounds access with the NDEBUG asserts
+compiled out.
+
+Suspect, NOT proven: `llama_context::graph_max_nodes` (llama-context.cpp:2351) gives QWEN35
+`n_tokens * 40` nodes, and the KIMI_K3 branch directly above carries the comment "the n_tokens*40
+budget below is exhausted at ubatch 3840" and uses `*160`. Our threshold sits exactly there. But a
+linear requirement `a*n + b` against a `40*n` budget can only fail always or never, never above a
+threshold, so node exhaustion cannot be the mechanism on its own.
+
+Next step: a stack trace (WinDbg/cdb, or a debug build) for the faulting frame. Note `auto_fhc` is on
+by default (llama-context.cpp:242) and has no CLI flag, so the DeepSeek V4 HC probe runs for every
+model. Practical ceiling today: ub=3072 at 131.5 t/s, +9% over ub=2048 and the best prefill number
+measured on this setup.
 
