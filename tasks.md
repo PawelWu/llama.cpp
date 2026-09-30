@@ -4,7 +4,41 @@ Branch: `pp-host-buft`, created from `any-draft-device-fix` (b1cb4909c).
 Parent work stashed on `pp-custom-device` (stash@{0}, "pp-custom-device WIP: forced offload branch ...").
 Note: commit 25515e4c7 (`--pp-dev` arg) is NOT in this branch. It comes back with the stash.
 
-Context: handoff.md sections 3 (corrected), 8.7, 8.8, 8.9. Read those first.
+## STATUS (2026-09-30)
+
+Phases 1-3 are DONE and verified. The rest of this file is the chronological session log; findings
+are listed here in their final state.
+
+Done:
+- per-device host buffer type (VulkanN_Host) for UMA devices, is_host = NULL, all four get_base
+  crash paths fixed (Phase 1 + FIRST..FOURTH FINDING)
+- pp-dev stash restored and measured on Qwen3.8-27B (FIFTH, SIXTH FINDING; SEVENTH FINDING = the
+  FLASH_ATTN forced-offload fix that stopped the long-prompt PP decay: PP 83.8 -> 122, flat)
+- CUDA0 as pp device: tested and CLOSED (74.0 vs 132.5-134.9 t/s, copy-path bound, see
+  "CUDA0 as pp device: closed")
+- MTP-on-dGPU validated end-to-end: TG 6.40-6.63 vs 4.16 no-spec (+59%); backlog item 2 done
+- chunked/streaming prefill: ABANDONED (docs moved to old_docs/)
+- tree hygiene done: debug prints and A/B toggles removed, junk deleted, closed session docs moved
+  to old_docs/ (index in old_docs/README.md)
+
+Open (in order):
+1. TG 3.41 vs 4.16 with pp-dev active: decode still gets 97 splits from the norm/l_last callback
+   pins (SEVENTH FINDING, "Remaining"). Small, separate change.
+2. ub >= 3840 segfault in the QWEN35 graph_reserve / DeepSeek V4 HC probe path. Needs a stack trace
+   (WinDbg/cdb or debug build). Practical ceiling today ub=3072 (PP 131.5).
+3. Zero-copy prefill: import the Vulkan1_Host allocations into V0 via VK_EXT_external_memory_host
+   (import_ptr + pinned-memory registry; the 8.2 blocker only affects imports into the AMD driver,
+   V0 is NVIDIA). Removes the 13.2 GB/ubatch weight copies, could push PP past 150. Bigger change,
+   needs design care.
+4. Section 9.0 decoupling: pp dev should not join params.devices. The tensor_split epsilon fix is
+   applied (SIXTH FINDING); the params.devices change is separate and needs a decision before commit.
+5. Before any commit (Phase 3 checklist): remove or keep dormant copy_lookahead (proven negative),
+   drop the GGML_OP_OFFLOAD_MIN_BATCH=1 advice from --pp-dev help text, revert the sched-dump
+   `#if 1` hunks and widened format strings, then open an upstream issue for the per-device host
+   buft (it changes buffer ownership semantics for every -ngl 0 / host-override config).
+
+Context: handoff.md section 0 (corrected), then 8 and 9. Read those first. Closed and superseded
+session docs live in old_docs/ (see old_docs/README.md for the index).
 
 ## Goal restated
 
