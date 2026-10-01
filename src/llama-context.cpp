@@ -540,6 +540,10 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 
         const uint32_t n_tokens_probe = probe.n_tokens_per_seq*n_seqs;
 
+        // the probe checks where the fused op ends up, so it must run with the same offload state
+        // as the batches that use it - the probe is decode-sized, so the pp backend stays off
+        sched_set_pp_backend(n_tokens_probe);
+
         auto * gf = graph_reserve(n_tokens_probe, n_seqs, n_tokens_probe, mctx, true);
         if (!gf) {
             throw std::runtime_error(std::string("failed to reserve graph for ") + probe.name + " check");
@@ -608,14 +612,20 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 }
 
-void llama_context::sched_set_pp_backend() {
+// smallest ubatch that is still worth running on the pp backend. the forced offload copies the
+// weights of every offloaded op to the pp backend, which costs the same per ubatch no matter its
+// size, so only prefill-sized batches can pay for it. decode batches (1 token, or a few with
+// speculative decoding) belong on the device that owns the weights
+static constexpr uint32_t PP_BACKEND_MIN_BATCH = 32;
+
+void llama_context::sched_set_pp_backend(uint32_t n_tokens) {
     if (!cparams.pp_backend) {
         return;
     }
 
     for (auto & backend : backend_ptrs) {
         if (ggml_backend_get_device(backend) == cparams.pp_backend) {
-            ggml_backend_sched_set_offload_backend(sched.get(), backend);
+            ggml_backend_sched_set_offload_backend(sched.get(), n_tokens >= PP_BACKEND_MIN_BATCH ? backend : nullptr);
             return;
         }
     }
@@ -681,7 +691,7 @@ void llama_context::sched_reserve() {
     gf_res_prev_active = nullptr;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
-    sched_set_pp_backend();
+    sched_set_pp_backend(n_tokens);
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -721,7 +731,7 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                sched_set_pp_backend();
+                sched_set_pp_backend(n_tokens);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -737,6 +747,10 @@ void llama_context::sched_reserve() {
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
     {
+        // the tg graph is reserved the way a decode ubatch is computed, so that the assignment and
+        // the buffer sizes match what the decode ubatches actually allocate
+        sched_set_pp_backend(n_seqs);
+
         auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
@@ -750,6 +764,8 @@ void llama_context::sched_reserve() {
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
+        sched_set_pp_backend(n_tokens);
+
         // TODO: the worst case graph is not always reached for `n_seqs > 1`
         //       need to implement a more robust mechanism that tries a few different inputs and analyzes the results
         ggml_cgraph * gf = nullptr;
@@ -1463,6 +1479,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     } else {
         gf_res_prev_active = nullptr;
         res->reset();
+
+        // the pp backend is enabled per ubatch: only prefill-sized batches make up for the weight
+        // copies that the forced offload needs
+        sched_set_pp_backend(ubatch.n_tokens);
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);

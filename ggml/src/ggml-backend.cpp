@@ -1977,7 +1977,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 }
 
 void ggml_backend_sched_set_offload_backend(ggml_backend_sched_t sched, ggml_backend_t backend) {
-    sched->offload_backend_id = ggml_backend_sched_backend_id(sched, backend);
+    sched->offload_backend_id = backend ? ggml_backend_sched_backend_id(sched, backend) : -1;
 }
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {

@@ -56,8 +56,8 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
-    // directs weight ops of large batches to cparams.pp_backend
-    void sched_set_pp_backend();
+    // directs weight ops of batches with at least `n_tokens` tokens to cparams.pp_backend
+    void sched_set_pp_backend(uint32_t n_tokens);
 
     void synchronize();
 

@@ -322,6 +322,7 @@ extern "C" {
     // run weight ops of large batches on this backend instead of the backend that holds the weights
     // the weights are copied into this backend's compute buffer, one set per graph split
     // ignored if the backend is not in the scheduler
+    // pass NULL to disable the forced offload again
     GGML_API void                 ggml_backend_sched_set_offload_backend(ggml_backend_sched_t sched, ggml_backend_t backend);
 
     // Initialize backend buffers from a measure graph

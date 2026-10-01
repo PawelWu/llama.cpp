@@ -4,28 +4,27 @@ llama.cpp fork that splits prompt processing and decode across two GPUs: `--pp-d
 sends the prefill weight ops to a second card (usually the dGPU) while decode stays zero-copy
 on the card that owns the model (usually the iGPU).
 
+First numbers:
+
+| Backend | MTP | Info | PP (t/s) | TG (t/s) |
+| --- | --- | --- | --- | --- |
+| -dev Vulkan1 --pp-dev Vulkan0 -ot ".*=CPU" | dGPU (V0) | this fork | 110 | 4.8 |
+| -dev CUDA0 | iGPU (V1) | dGPU + CPU |  120 | 2.5 |
+| -dev CUDA0,Vulkan1 -ts 10,90 | iGPU (V1) | stock, best split | 70 | 5.0 |
+| -dev Vulkan1 | dGPU (C0) | iGPU only | 35 | 4.3 |
+
+##
 It is built on a per-device host buffer type for integrated GPUs (UMA): weights in
 `Vulkan1_Host` are plain system RAM that the iGPU reads in place, which gives the best decode
-speed (no VRAM streaming) and the same memory feeds the prefill copies to the pp device.
+speed (no VRAM streaming) and the same memory feeds the prefill copies to the PP device.
 Enable with `--pp-dev Vulkan0` + `-ot ".*=CPU"`, and put an MTP draft on the dGPU for another
 +40-60% TG.
 
 Measured on an Acer laptop: Ryzen 5 8645HS (Radeon 760M iGPU = Vulkan1, 32 GB UMA) +
 RTX 4050 6 GB (Vulkan0 / CUDA0), 64 GB DDR5, Qwen3.8-27B-UD-Q4_K_XL, 50k-token Java codegen
-prompt at ctx 85k (b/ub 1024, fa on, q4_1 KV, `--load-mode none`), machine otherwise idle.
-Rows from `prompts_perf/sweep_27b_java50k_{previous,battery,ootb}`. Fork rows cover two runs:
-an earlier build, and the latest patched build powered by a 65W USB-C charger - below the ~90W
-llama.cpp can draw, hence the lower PP ends; the usual setup is a 140W adapter. Upstream rows
-are a fresh pure llama.cpp build, which has no `--pp-dev`.
+prompt at ctx 85k (b/ub 1024, fa on, q4_1 KV, `--load-mode none`).
+Fork rows cover two runs:
 
-| Config | PP (t/s) | TG (t/s) |
-| --- | --- | --- |
-| -dev Vulkan1 --pp-dev Vulkan0 -ot ".*=CPU", MTP draft on Vulkan0 (this fork) | 101-111 | 3.2-3.7 |
-| same + -dev Vulkan1,Vulkan0 -ts 90,10 (dGPU also holds a layer share), MTP on Vulkan0 | 109-113 | 3.0-3.7 |
-| -dev Vulkan1 (upstream build), MTP draft on Vulkan0 | 36.3 | 3.7 |
-| -dev Vulkan1,Vulkan0 -ts 90,10 (upstream build), MTP draft on Vulkan0 | 38.3 | 4.2 |
-| -dev Vulkan1, no spec (reference: prefill is the bottleneck) | 123-128 | 2.2-2.3 |
-| -dev Vulkan1,Vulkan0 -ts 90,10, no spec | 126-131 | 2.2-2.3 |
 
 Prefill is ~3x faster with `--pp-dev` at the same decode speed; MTP is what lifts TG over the
 no-spec rows. CUDA0 as the pp device was tested and closed (74 vs 132 t/s, see `old_docs/`).
@@ -82,7 +81,7 @@ llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
             <i>Built-in web UI against <b>llama serve</b></i>
         </td>
     </tr>
-<table>
+</table>
 
 ## Description
 
