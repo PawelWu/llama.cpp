@@ -2766,6 +2766,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PP_DEV"));
     add_opt(common_arg(
+        {"--pp-dev-resident"},
+        "keep the weights of the layers that --pp-dev owns in its own VRAM\n"
+        "the layers are the ones the layer split assigns to the pp device (-ts/--tensor-split)\n"
+        "so they are read in place instead of being copied on every prefill batch",
+        [](common_params & params) {
+            params.pp_dev_resident = true;
+        }
+    ).set_env("LLAMA_ARG_PP_DEV_RESIDENT"));
+    add_opt(common_arg(
         {"-ot", "--override-tensor"}, "<tensor name pattern>=<buffer type>,...",
         "override tensor buffer type", [](common_params & params, const std::string & value) {
             parse_tensor_buffer_overrides(value, params.tensor_buft_overrides);

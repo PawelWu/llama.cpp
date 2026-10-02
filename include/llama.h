@@ -346,6 +346,10 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // keep the weights of the layers assigned to this device in its own buffer type (NULL = disabled)
+        // the layers are the ones that the layer split assigns to the device (see tensor_split)
+        ggml_backend_dev_t pp_dev_resident;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data
