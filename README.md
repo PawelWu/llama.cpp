@@ -4,7 +4,10 @@ llama.cpp fork that splits prompt processing and decode across two GPUs: `--pp-d
 sends the prefill weight ops to a second card (usually the dGPU) while decode stays zero-copy
 on the card that owns the model (usually the iGPU).
 
-First numbers:
+It works great for dense models which don't fit into dGPU like Qwen 27B. While iGPU has the RAM capacity, dGPU can provide boost to PP.  
+In my case the numbers went from 35 -> 110 t/s during PP, and TG took minor hit 5.0 -> 4.8 t/s. 
+
+First the numbers:
 
 | Backend | MTP | Info | PP (t/s) | TG (t/s) |
 | --- | --- | --- | --- | --- |
@@ -13,24 +16,23 @@ First numbers:
 | -dev CUDA0,Vulkan1 -ts 10,90 | iGPU (V1) | stock, best split | 70 | 5.0 |
 | -dev Vulkan1 | dGPU (C0) | iGPU only | 35 | 4.3 |
 
-##
+Measured on an Acer laptop: Ryzen 5 8645HS (Radeon 760M iGPU = Vulkan1, 32 GB UMA) +
+RTX 4050 6 GB (Vulkan0 / CUDA0), 64 GB DDR5, Qwen3.8-27B-UD-Q4_K_XL, 50k-token Java codegen
+prompt at ctx 85k (b/ub 1024, fa on, q4_1 KV, `--load-mode none`).
+
+## How it works
 It is built on a per-device host buffer type for integrated GPUs (UMA): weights in
 `Vulkan1_Host` are plain system RAM that the iGPU reads in place, which gives the best decode
 speed (no VRAM streaming) and the same memory feeds the prefill copies to the PP device.
 Enable with `--pp-dev Vulkan0` + `-ot ".*=CPU"`, and put an MTP draft on the dGPU for another
 +40-60% TG.
 
-Measured on an Acer laptop: Ryzen 5 8645HS (Radeon 760M iGPU = Vulkan1, 32 GB UMA) +
-RTX 4050 6 GB (Vulkan0 / CUDA0), 64 GB DDR5, Qwen3.8-27B-UD-Q4_K_XL, 50k-token Java codegen
-prompt at ctx 85k (b/ub 1024, fa on, q4_1 KV, `--load-mode none`).
-Fork rows cover two runs:
+Right now I couldn't make CUDA work as the pp device - it can't access Vulkan_Host memory, so i tried streaming weights from RAM, 
+in the end it didn't help (got 74 vs 132 t/s).
 
-
-Prefill is ~3x faster with `--pp-dev` at the same decode speed; MTP is what lifts TG over the
-no-spec rows. CUDA0 as the pp device was tested and closed (74 vs 132 t/s, see `old_docs/`).
-
-Based on branch `any-draft-device-fix`, which fixes `--spec-draft-device` selecting a device
-outside `--device` ("cannot run the operation (NONE)" error).
+### Additional info
+Based on my other forked branch `any-draft-device-fix`, which fixes `--spec-draft-device` when selecting a device
+not present in `--device` (it produced "cannot run the operation (NONE)" error).
 
 # llama.cpp
 
