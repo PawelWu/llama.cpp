@@ -21,21 +21,35 @@ Done:
 - tree hygiene done: debug prints and A/B toggles removed, junk deleted, closed session docs moved
   to old_docs/ (index in old_docs/README.md)
 
+## STATUS UPDATE (2026-10-02)
+
+Merge `897520425` (any-draft-device-fix -> pp-host-buft) concluded. The custom per-device Vulkan host
+buft was adapted to the new `alloc_buffer_n` / `get_alloc_size_n` iface fields (required, the struct
+is positional). Review verdict: both conflicts resolved clean, every custom hunk preserved.
+
+Item 1 (TG vs pp-dev) RESOLVED - the old number predated the c6a29d862 TG fix. Measured on the merged
+build (GGML_SCHED_DEBUG=1): the decode graph is a single Vulkan1 split (pre-fix h2_scheddump.log
+showed the alternating norm-on-Vulkan0 pattern), and TG with/without pp-dev is 4.16 vs 4.22 t/s at
+ctx 4096 - within noise.
+
+Item 3 (zero-copy prefill via VK_EXT_external_memory_host) CLOSED - NOT worth it. Probe (bench_import,
+untracked): both GPUs expose VK_EXT_external_memory_host and NVIDIA V0 imports a foreign page-aligned
+host pointer (OK). But shader reads from imported host memory run at ~6.4 GB/s vs 13.37 GB/s for a
+single V0 DMA copy, so in-place compute is 1.65x slower per weight (80.4 ms vs 48.7 ms for 512 MiB,
+R=1) and the gap grows with reuse -> staging into VRAM wins. Side finding: the real pp-dev copy path
+moves 13.2 GB/ubatch at ~3.1 GB/s (4.22 s) while the same GPU sustains 13.37 GB/s for one DMA, so
+the copy path, not weight placement, is the PP lever.
+
+Item 5 (Phase 3 checklist) DONE, and the upstream issue is dropped - this is a private fork.
+
 Open (in order):
-1. TG 3.41 vs 4.16 with pp-dev active: decode still gets 97 splits from the norm/l_last callback
-   pins (SEVENTH FINDING, "Remaining"). Small, separate change.
-2. ub >= 3840 segfault in the QWEN35 graph_reserve / DeepSeek V4 HC probe path. Needs a stack trace
+1. ub >= 3840 segfault in the QWEN35 graph_reserve / DeepSeek V4 HC probe path. Needs a stack trace
    (WinDbg/cdb or debug build). Practical ceiling today ub=3072 (PP 131.5).
-3. Zero-copy prefill: import the Vulkan1_Host allocations into V0 via VK_EXT_external_memory_host
-   (import_ptr + pinned-memory registry; the 8.2 blocker only affects imports into the AMD driver,
-   V0 is NVIDIA). Removes the 13.2 GB/ubatch weight copies, could push PP past 150. Bigger change,
-   needs design care.
-4. Section 9.0 decoupling: pp dev should not join params.devices. The tensor_split epsilon fix is
+2. Section 9.0 decoupling: pp dev should not join params.devices. The tensor_split epsilon fix is
    applied (SIXTH FINDING); the params.devices change is separate and needs a decision before commit.
-5. Before any commit (Phase 3 checklist): remove or keep dormant copy_lookahead (proven negative),
-   drop the GGML_OP_OFFLOAD_MIN_BATCH=1 advice from --pp-dev help text, revert the sched-dump
-   `#if 1` hunks and widened format strings, then open an upstream issue for the per-device host
-   buft (it changes buffer ownership semantics for every -ngl 0 / host-override config).
+3. PP copy path: close the 3.1 -> 13.37 GB/s gap (fewer/larger/async weight copies, or import the
+   V1_Host allocation into V0 and DMA from the imported source per ubatch). New, from the 2026-10-02
+   B3 investigation.
 
 Context: handoff.md section 0 (corrected), then 8 and 9. Read those first. Closed and superseded
 session docs live in old_docs/ (see old_docs/README.md for the index).

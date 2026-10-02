@@ -363,6 +363,26 @@ llama_context::llama_context(
             }
         }
 
+        // the prefill device is a scheduler target, not a model device: it holds no weights or KV,
+        // so it joins the backend list only (an explicitly listed prefill device is already among
+        // model.devices and is skipped here)
+        if (cparams.pp_backend) {
+            bool found = false;
+            for (const auto & dev : model.devices) {
+                if (dev.dev == cparams.pp_backend) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                ggml_backend_t backend = ggml_backend_dev_init(cparams.pp_backend, nullptr);
+                if (backend == nullptr) {
+                    throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(cparams.pp_backend)));
+                }
+                backends.emplace_back(backend);
+            }
+        }
+
         // add ACCEL backends (such as BLAS)
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
