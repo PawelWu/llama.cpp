@@ -399,3 +399,72 @@ Verdict: drop the lookahead code, keep the gate and the profiling helper.
 
 ---
 
+## 11. The "lost performance" (2026-10-02): diagnosis
+
+### 11.1 The A/B that produced the loss number was not an A/B
+
+The two server logs this branch was judged on are `llama_Vulkan1_MXFP4_ootb.log` (PP 56.49, TG 6.22) and
+`llama_Vulkan1_MXFP4_feature.log` (PP 112.35, TG 4.69), same 5761-token prompt, same MTP preset. Read them
+as "the feature doubles prefill and costs 25 % decode". Both of them ran **different, stale binaries**:
+
+| log | binary | binary date | tree state |
+|---|---|---|---|
+| ootb | `D:\progs\llama-pp\llama-server.exe` | ggml-vulkan.dll Sep 23 | before the per-device host buft |
+| feature | `D:\progs\llama-cpp-adv\llama-server.exe` | Oct 1 21:02 | before `c6a29d862` (Oct 1 22:22) and before `37c345001` (the 9.0 decoupling) |
+
+The ootb log also shows the old placement: `Vulkan1 model buffer size = 14792.22 MiB` plus
+`Vulkan_Host model buffer size = 1288.28 MiB` - that 1288 MiB is the **global** pinned host buft bound to
+Vulkan device 0, so it is CPU-owned and computed on the CPU. On the current tree the same config reports
+`Vulkan1_Host = 1288.28 MiB`, which the iGPU reads in place.
+
+The feature log's TG 4.69 is the `ssm_norm` bug fixed in `c6a29d862`: `ggml_backend_sched_op_batch_size()`
+reported 48 rows for the GDN `ssm_norm` MUL at batch 1, which passed the `>= 32` gate and forced 48 extra
+splits plus a V0 round trip per layer per token. That build predates the fix.
+
+So the comparison mixed three variables - weight placement, pp-dev, and two different binaries - and none
+of the three is "the feature". **Nothing was lost in the code.**
+
+### 11.2 Controlled A/B on one build (HEAD `a2500d093`)
+
+`llama-cli`, Qwen3.8-27B-MXFP4, prompt_10000 (9762 tokens), `-c 24576 -b 1024 -ub 1024 -fa on -ctk q4_1
+-ctv q4_1 -t 6 -tb 6 -n 64 -st -lv 5`, MTP `draft-mtp n-max 3 q4_1` on Vulkan1. Only the layout changes.
+Logs: `prompts_perf/pp_tradeoff/`.
+
+| tag | layout | weights | PP t/s | TG t/s | draft acc |
+|---|---|---|---|---|---|
+| t1_ootb | stock offload, no pp-dev | Vulkan1 dev 14792.22 + Vulkan1_Host 1288.28 | 53.4 / 56.1 | 6.7 / 6.8 | 0.815 |
+| t2_host | `-ot ".*=CPU"`, no pp-dev | Vulkan1_Host 16080.50 | 59.4 | 6.8 | 0.815 |
+| t3_feature | `-ot ".*=CPU" --pp-dev Vulkan0` | Vulkan1_Host 16080.50 | 111.1 | 6.2 | 0.700 |
+
+No-spec control, same prompt and flags minus the MTP args:
+
+| tag | layout | PP t/s | TG t/s |
+|---|---|---|---|
+| t7_ootb_ns | stock offload | 54.2 | 4.1 |
+| t8_host_ns | Vulkan1_Host | 56.5 | 4.0 |
+| t9_feat_ns | Vulkan1_Host + pp-dev | 114.1 | 3.9 |
+
+Readings:
+
+1. **Host-visible weights are free for decode.** t1 vs t2 is the placement question alone: 6.7-6.8 t/s
+   either way, and identical draft acceptance. UMA means `Vulkan1_Host` and the device buft are the same
+   physical DRAM, so there is nothing to recover here.
+2. **pp-dev costs decode, not placement.** t2 -> t3 is pp-dev alone: TG 6.8 -> 6.2 with MTP (-9 %), 4.0 -> 3.9
+   without (-3 %). Both are one-run numbers, so treat -3 % as noise and -9 % as the real ceiling.
+   Part of the -9 % is the draft acceptance drop (0.815 -> 0.700), not per-token decode cost.
+3. **Prefill is the win and it is not marginal.** 2.0x without MTP (54.2 -> 114.1), 2.0x with (56.1 -> 111.1).
+
+### 11.3 What is actually left to fix
+
+- Nothing to restore in the code for the reported regression. The action is operational: refresh
+  `D:\progs\llama-cpp-adv` from the current build and re-run the identical 5761-token preset comparison.
+  `D:\progs\llama-cpp-pp` (Sep 27-28) predates the per-device host buft entirely and is not a valid
+  "feature" baseline.
+- The one genuine cost left is the ~9 % MTP decode loss with pp-dev (6.8 -> 6.2). The decode graph is a
+  single Vulkan1 split (verified with `GGML_SCHED_DEBUG=1`), so it is not split overhead; the candidates are
+  the ~270 small activation copies per token and the draft/verify graphs interleaving with the forced-offload
+  device. Not measured yet - needs a per-split profile of the decode graph with MTP on.
+
+Full matrix of the current build (ub axis, ts splits, MTP device, resident, 30k prompt) is in
+`prompts_perf/super_sweep/` with the write-up in `super_sweep.md`.
+

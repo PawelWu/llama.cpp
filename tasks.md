@@ -43,13 +43,32 @@ the copy path, not weight placement, is the PP lever.
 Item 5 (Phase 3 checklist) DONE, and the upstream issue is dropped - this is a private fork.
 
 Open (in order):
-1. ub >= 3840 segfault in the QWEN35 graph_reserve / DeepSeek V4 HC probe path. Needs a stack trace
-   (WinDbg/cdb or debug build). Practical ceiling today ub=3072 (PP 131.5).
-2. Section 9.0 decoupling: pp dev should not join params.devices. The tensor_split epsilon fix is
-   applied (SIXTH FINDING); the params.devices change is separate and needs a decision before commit.
-3. PP copy path: close the 3.1 -> 13.37 GB/s gap (fewer/larger/async weight copies, or import the
+1. PP copy path: close the 3.1 -> 13.37 GB/s gap (fewer/larger/async weight copies, or import the
    V1_Host allocation into V0 and DMA from the imported source per ubatch). New, from the 2026-10-02
    B3 investigation.
+2. The ~9% MTP decode cost with pp-dev (TG 6.8 -> 6.2). Decode is a single Vulkan1 split, so it is not
+   split overhead; needs a per-split profile of the decode graph with MTP on.
+3. ub >= 3840 segfault in the QWEN35 graph_reserve / DeepSeek V4 HC probe path. Needs a stack trace
+   (WinDbg/cdb or debug build). NOTE: did NOT reproduce at ub 4096/5120 with mxFP4 at -c 32768, so the
+   trigger is the context size or the model, not the ubatch alone.
+
+## STATUS UPDATE (2026-10-02, session 2)
+
+Closed: the "lost performance" is not a code regression. Both server logs it came from ran stale
+binaries (`d:\progs\llama-cpp-adv` Oct 1 21:02 = before `c6a29d862`; `d:\progs\llama-cpp-pp` Sep 27 =
+before the per-device host buft). Controlled A/B on one build is in handoff.md section 11:
+host-visible weights cost nothing for decode, pp-dev costs ~9% TG with MTP and ~3% without, and
+prefill doubles (54.2 -> 114.1 no-spec, 56.1 -> 111.1 with MTP). Action item is operational:
+refresh the deployed copies.
+
+Also done: section 9.0 decoupling (commit `37c345001`) and `--pp-dev-resident` restored
+(commit `a2500d093`). Full matrix sweep (ub 2048-5120, ts splits, MTP device, resident, 30k prompt)
+in `super_sweep.md`, logs in `prompts_perf/super_sweep/`, harnesses `prompts_perf/super_sweep.bat`
+and `prompts_perf/pp_tradeoff.bat`.
+
+Best measured config: `-dev Vulkan1,Vulkan0 -ts 90,10 --pp-dev Vulkan0 -ot ".*=CPU"
+--pp-dev-resident` = 118.4 PP / 6.6 TG at 5k; 2.8x ootb prefill on a 30k prompt (116.7 vs 41.8,
+and 3.4x on the last chunk). Best prefill overall 135.2 t/s at ub 3072 with MTP.
 
 Context: handoff.md section 0 (corrected), then 8 and 9. Read those first. Closed and superseded
 session docs live in old_docs/ (see old_docs/README.md for the index).

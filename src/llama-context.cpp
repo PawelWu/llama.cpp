@@ -743,6 +743,15 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
 
+    // resolve_fused_ops runs decode-sized probes and leaves the pp backend off, so set it again
+    // GGML_PP_NORESV_FIX=1 keeps the old behavior, to A/B the reserve-time offload state
+    // value-based on purpose: an env var set to an empty string is still "set", and a batch
+    // `set VAR=` that keeps the trailing space is easy to get wrong
+    const char * no_resv_fix = getenv("GGML_PP_NORESV_FIX");
+    if (no_resv_fix == NULL || no_resv_fix[0] != '1') {
+        sched_set_pp_backend(n_tokens);
+    }
+
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),

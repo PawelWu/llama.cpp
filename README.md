@@ -4,17 +4,19 @@ llama.cpp fork that splits prompt processing and decode across two GPUs: `--pp-d
 sends the prefill weight ops to a second card (usually the dGPU) while decode stays zero-copy
 on the card that owns the model (usually the iGPU).
 
-It works great for dense models which don't fit into dGPU like Qwen 27B. While iGPU has the RAM capacity, dGPU can provide boost to PP.  
-In my case the numbers went from 35 -> 110 t/s during PP, and TG took minor hit 5.0 -> 4.8 t/s. 
+It works great for dense models which don't fit into dGPU like Qwen 27B. While iGPU has the RAM capacity, dGPU can provide boost to PP.
+In my case the numbers went from 35 -> 110 t/s during PP, and TG took minor hit 5.0 -> 4.8 t/s.
+Bonus points are that PP performance barely degrades in context 50k+
 
 First the numbers:
 
 | Backend | MTP | Info | PP (t/s) | TG (t/s) |
 | --- | --- | --- | --- | --- |
 | -dev Vulkan1 --pp-dev Vulkan0 -ot ".*=CPU" | dGPU (V0) | this fork | 110 | 4.8 |
+| -dev Vulkan1,Vulkan0 -ts 90,10 --pp-dev Vulkan0 -ot ".*=CPU" -pp-dev-resident on  | dGPU (V0) | this fork | 100 | 4.5 |
 | -dev CUDA0 | iGPU (V1) | dGPU + CPU |  120 | 2.5 |
-| -dev CUDA0,Vulkan1 -ts 10,90 | iGPU (V1) | stock, best split | 70 | 5.0 |
 | -dev Vulkan1 | dGPU (C0) | iGPU only | 35 | 4.3 |
+| -dev CUDA0,Vulkan1 -ts 10,90 | iGPU (V1) | stock, best split | 70 | 5.0 |
 
 Measured on an Acer laptop: Ryzen 5 8645HS (Radeon 760M iGPU = Vulkan1, 32 GB UMA) +
 RTX 4050 6 GB (Vulkan0 / CUDA0), 64 GB DDR5, Qwen3.8-27B-UD-Q4_K_XL, 50k-token Java codegen
@@ -26,9 +28,15 @@ It is built on a per-device host buffer type for integrated GPUs (UMA): weights 
 speed (no VRAM streaming) and the same memory feeds the prefill copies to the PP device.
 Enable with `--pp-dev Vulkan0` + `-ot ".*=CPU"`, and put an MTP draft on the dGPU for another
 +40-60% TG.
+`-pp-dev-resident [on|off]` - turn on when using --pp-dev Vulkan0 with split -dev Vulkan1,Vulkan0 to use Vulkan1 VRAM.
+The residency doesn't work great on my machine at 50k+ context - the PCIE gets saturated and performance degrades.
 
-Right now I couldn't make CUDA work as the pp device - it can't access Vulkan_Host memory, so i tried streaming weights from RAM, 
+Right now I couldn't make CUDA work as the pp device - it can't access Vulkan_Host memory, so i tried streaming weights from RAM,
 in the end it didn't help (got 74 vs 132 t/s).
+
+### What's missing
+CUDA as of now can't access host RAM directly, at least with Windows drivers. That leaves some performance on the table and forces the use of Vulkan on Nvidia cards.
+It can't be used as --pp-dev, or at least on my machine the performance drops 110 -> 70t/s.
 
 ### Additional info
 Based on my other forked branch `any-draft-device-fix`, which fixes `--spec-draft-device` when selecting a device

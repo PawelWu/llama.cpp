@@ -2534,6 +2534,30 @@ common_speculative_init_result::common_speculative_init_result(
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
 
+    // block-diffusion drafts never decode more than one noise block per pass, and the prompt path is
+    // chunked by this context's own ubatch - so a small n_batch is enough and keeps the flash-attn
+    // working set from OOM'ing on a dGPU that also hosts the target's pp-staging buffers
+    {
+        const bool has_block_draft = std::any_of(
+            params.speculative.types.begin(),
+            params.speculative.types.end(),
+            [](common_speculative_type t) {
+                return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            });
+        if (has_block_draft)
+        {
+            const char * e = std::getenv("GGML_DRAFT_B");
+            const int32_t cap = e ? std::atoi(e) : 0;
+            if (cap > 0 && cparams.n_batch > cap)
+            {
+                LOG_INF("%s: clamping draft context n_batch to %d (GGML_DRAFT_B), was %d\n",
+                        __func__, (int) cap, (int) cparams.n_batch);
+                cparams.n_batch  = cap;
+                cparams.n_ubatch = std::min((int32_t) cparams.n_ubatch, cap);
+            }
+        }
+    }
+
     std::string model_path;
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;

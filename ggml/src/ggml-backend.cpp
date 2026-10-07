@@ -1128,6 +1128,20 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         }
     }
 
+    // RMS_NORM has no weight source (eps is an op param), so it would follow its input onto the
+    // device holding the weights and its output would then be copied once per consumer on the
+    // pp device. force it there for prefill-sized batches, same as FLASH_ATTN_EXT above
+    // GGML_PP_NO_NORM=1 disables this, to A/B the split count on a single binary
+    static const bool force_norm_offload = getenv("GGML_PP_NO_NORM") == NULL;
+    if (force_norm_offload && sched->op_offload && sched->offload_backend_id >= 0 && tensor->op == GGML_OP_RMS_NORM &&
+        ggml_backend_sched_op_batch_size(tensor) >= sched->offload_backend_min_batch) {
+        ggml_backend_t backend = sched->backends[sched->offload_backend_id];
+        if (ggml_backend_supports_op(backend, tensor)) {
+            SET_CAUSE(tensor, "1.off_norm");
+            return sched->offload_backend_id;
+        }
+    }
+
     if (allow) {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             const struct ggml_tensor * src = tensor->src[i];
