@@ -1,7 +1,5 @@
 #include "ggml-vulkan-common.h"
 
-#include <cstdlib>
-
 ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface = {
     /* .get_name            = */ ggml_backend_vk_buffer_type_name,
     /* .alloc_buffer        = */ ggml_backend_vk_buffer_type_alloc_buffer,
@@ -726,33 +724,18 @@ void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& src, size
     } else {
         VK_LOG_DEBUG("ggml_vk_buffer_copy(MULTI_DEVICE, " << size << ")");
 
-        // NOTE: do not shortcut uncached host-visible sources with a CPU memcpy of the mapped
-        // pointer. Reads from uncached UMA host memory run at about 100 MB/s, while the GPU copy
-        // to staging runs at DRAM speed. Cached sources are plain pinned system memory the CPU
-        // can read directly, and the src queue is not stopped for a stage copy.
-        // Test the shortcut with GGML_VK_HOST_STAGE=1.
-        static const bool host_stage = []() {
-            const char * env = getenv("GGML_VK_HOST_STAGE");
-            return env != NULL && atoi(env) != 0;
-        }();
-
-        const bool src_cached   = !!(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached);
-        const bool src_visible  = !!(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible);
-
-        const bool host_direct = host_stage && src_cached && src_visible;
-
-        // Copy device to device
-        if (!host_direct) {
+        // only cached host memory may be read by the CPU - see ggml_vk_pp_dev_host_stage
+        if (ggml_vk_pp_dev_host_stage(src)) {
+            // Copy to dst buffer straight from the mapped source
+            ggml_vk_buffer_write(dst, dst_offset, (const uint8_t *) src->ptr + src_offset, size);
+        } else {
+            // Copy device to device
             ggml_vk_ensure_sync_staging_buffer(src->device, size);
 
             // Copy to src staging buffer
             ggml_vk_buffer_copy(src->device->sync_staging, 0, src, src_offset, size);
-        }
 
-        // Copy to dst buffer
-        if (host_direct) {
-            ggml_vk_buffer_write(dst, dst_offset, (const uint8_t *) src->ptr + src_offset, size);
-        } else {
+            // Copy to dst buffer
             ggml_vk_buffer_write(dst, dst_offset, src->device->sync_staging->ptr, size);
         }
     }
