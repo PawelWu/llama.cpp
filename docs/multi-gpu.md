@@ -40,6 +40,7 @@ Set with `--split-mode` / `-sm`.
 | `-ngl` | `--n-gpu-layers` / `--gpu-layers` | integer \| `auto` \| `all` | `auto` | Maximum number of layers to keep in VRAM. Use `999` or `all` to push everything possible to the GPUs. |
 | `-dev` | `--device` | comma-separated device names, or `none` | auto | Restrict which devices llama.cpp may use. See `--list-devices` for names. |
 | | `--list-devices` | - | - | Print the available devices and their memory. Run this first to learn the names you'd pass to `--device`. |
+| | `--pp-dev` | one device name | not set | Run prefill-sized batches on a separate device while the weights stay where they are. See [the prefill device](pp-dev.md) for this flag, `--pp-dev-resident`, and the env vars that tune it. |
 | `-fa` | `--flash-attn` | `on` \| `off` \| `auto` | `auto` | Required when using `--split-mode tensor` and/or quantized V cache. Supported (and therefore enabled by default) for most combinations of models and backends. |
 | `-ctk` | `--cache-type-k` | `f32` \| `f16` \| `bf16` \| `q8_0` \| `q4_0` \| ... | `f16` | KV cache type for K. |
 | `-ctv` | `--cache-type-v` | same as `-ctk` | `f16` | KV cache type for V. |
