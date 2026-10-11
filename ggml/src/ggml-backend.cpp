@@ -10,6 +10,7 @@
 
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-backend-pp-dev.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
@@ -973,8 +974,7 @@ struct ggml_backend_sched {
     size_t context_buffer_size;
 
     bool op_offload;
-    int offload_backend_id; // backend that should run weight ops of large batches, -1 = disabled
-    int offload_backend_min_batch; // minimum batch size to force an op onto the offload backend
+    int offload_backend_id; // backend chosen through ggml_backend_sched_set_offload_backend, -1 = disabled
 
     int debug;
 
@@ -1062,21 +1062,6 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 #define GET_CAUSE(node) ""
 #endif
 
-static int ggml_backend_sched_op_batch_size(const struct ggml_tensor * op) {
-    switch (op->op) {
-        case GGML_OP_GET_ROWS:
-            return 0;
-        case GGML_OP_MUL_MAT:
-            return op->ne[1];
-        case GGML_OP_MUL_MAT_ID:
-        case GGML_OP_ROPE:
-        case GGML_OP_ROPE_BACK:
-            return op->ne[2];
-        default:
-            return ggml_nrows(op);
-    }
-}
-
 // returns the backend that should be used for the node based on the current locations
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
     // assign pre-allocated nodes to their backend
@@ -1118,31 +1103,17 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
     // skip FLASH_ATTN_EXT since the sinks tensor is too small to choose a based based on it
     allow = allow && tensor->op != GGML_OP_FLASH_ATTN_EXT;
 
-    // FLASH_ATTN_EXT has no weight sources, so it would always follow its KV cache inputs.
-    // when a pp backend is selected, run it there for prefill-sized batches: attention cost
-    // grows with n_kv and would otherwise keep the whole prefill on the device that holds
-    // the KV cache, no matter how much faster the other devices are
-    if (sched->op_offload && sched->offload_backend_id >= 0 && tensor->op == GGML_OP_FLASH_ATTN_EXT &&
-        ggml_backend_sched_op_batch_size(tensor) >= sched->offload_backend_min_batch) {
-        ggml_backend_t backend = sched->backends[sched->offload_backend_id];
-        if (ggml_backend_supports_op(backend, tensor)) {
-            SET_CAUSE(tensor, "1.off_fa");
-            return sched->offload_backend_id;
-        }
+    // attention and rms norm have no weight sources, so they follow their data inputs by default.
+    // for prefill-sized batches the pp backend runs them instead - the rules live in ggml-backend-pp-dev.cpp
+    if (sched->op_offload && sched->offload_backend_id >= 0
+        && ggml_backend_pp_dev_force_flash_attn(sched->backends[sched->offload_backend_id], tensor)) {
+        SET_CAUSE(tensor, "1.off_fa");
+        return sched->offload_backend_id;
     }
-
-    // RMS_NORM has no weight source (eps is an op param), so it would follow its input onto the
-    // device holding the weights and its output would then be copied once per consumer on the
-    // pp device. force it there for prefill-sized batches, same as FLASH_ATTN_EXT above
-    // GGML_PP_NO_NORM=1 disables this, to A/B the split count on a single binary
-    static const bool force_norm_offload = getenv("GGML_PP_NO_NORM") == NULL;
-    if (force_norm_offload && sched->op_offload && sched->offload_backend_id >= 0 && tensor->op == GGML_OP_RMS_NORM &&
-        ggml_backend_sched_op_batch_size(tensor) >= sched->offload_backend_min_batch) {
-        ggml_backend_t backend = sched->backends[sched->offload_backend_id];
-        if (ggml_backend_supports_op(backend, tensor)) {
-            SET_CAUSE(tensor, "1.off_norm");
-            return sched->offload_backend_id;
-        }
+    if (sched->op_offload && sched->offload_backend_id >= 0
+        && ggml_backend_pp_dev_force_rms_norm(sched->backends[sched->offload_backend_id], tensor)) {
+        SET_CAUSE(tensor, "1.off_norm");
+        return sched->offload_backend_id;
     }
 
     if (allow) {
@@ -1153,16 +1124,11 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
             }
             if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
-                // the caller selected a backend to run weight ops on, the weights are copied to it
-                // the copies are allocated per split and reused by ggml-alloc, so the compute buffer stays small
-                if (sched->op_offload && sched->offload_backend_id >= 0 && sched->offload_backend_id != src_backend_id) {
-                    ggml_backend_t backend = sched->backends[sched->offload_backend_id];
-                    // only prefill-sized batches are forced, decode (batch = 1) stays with the weights
-                    if (ggml_backend_supports_op(backend, tensor) && ggml_backend_offload_op(backend, tensor) &&
-                        ggml_backend_sched_op_batch_size(tensor) >= sched->offload_backend_min_batch) {
-                        SET_CAUSE(tensor, "1.off_forced");
-                        return sched->offload_backend_id;
-                    }
+                // the pp backend runs weight ops of large batches, with the weights copied to it
+                if (sched->op_offload && sched->offload_backend_id >= 0 && sched->offload_backend_id != src_backend_id
+                    && ggml_backend_pp_dev_force_weighted_op(sched->backends[sched->offload_backend_id], tensor)) {
+                    SET_CAUSE(tensor, "1.off_forced");
+                    return sched->offload_backend_id;
                 }
                 // check if a backend with higher prio wants to offload the op
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
@@ -2056,7 +2022,6 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
     sched->offload_backend_id = -1;
-    sched->offload_backend_min_batch = 32;
 
     ggml_backend_sched_reset(sched);
 
