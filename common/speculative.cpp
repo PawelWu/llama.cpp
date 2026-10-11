@@ -8,6 +8,7 @@
 #include "ngram-cache.h"
 #include "ngram-map.h"
 #include "ngram-mod.h"
+#include "pp-dev.h"
 #include "sampling.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
@@ -2622,23 +2623,10 @@ common_speculative_init_result::common_speculative_init_result(
     // chunked by this context's own ubatch - so a small n_batch is enough and keeps the flash-attn
     // working set from OOM'ing on a dGPU that also hosts the target's pp-staging buffers
     {
-        const bool has_block_draft = std::any_of(
-            params.speculative.types.begin(),
-            params.speculative.types.end(),
-            [](common_speculative_type t) {
-                return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
-            });
-        if (has_block_draft)
-        {
-            const char * e = std::getenv("GGML_DRAFT_B");
-            const int32_t cap = e ? std::atoi(e) : 0;
-            if (cap > 0 && cparams.n_batch > cap)
-            {
-                LOG_INF("%s: clamping draft context n_batch to %d (GGML_DRAFT_B), was %d\n",
-                        __func__, (int) cap, (int) cparams.n_batch);
-                cparams.n_batch  = cap;
-                cparams.n_ubatch = std::min((int32_t) cparams.n_ubatch, cap);
-            }
+        const int32_t cap = common_pp_dev_draft_batch_cap(params.speculative.types, cparams.n_batch);
+        if (cap > 0) {
+            cparams.n_batch  = cap;
+            cparams.n_ubatch = std::min((int32_t) cparams.n_ubatch, cap);
         }
     }
 

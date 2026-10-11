@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 #include "gguf.h"
+#include "pp-dev.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -1653,21 +1654,12 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     // the prefill device is a scheduler backend only (added in llama-context.cpp), it is not
     // appended to params.devices: a device that holds no weights must not claim layers or KV.
     // an explicitly listed prefill device stays a full model device and keeps its -ts share
-    if (params.pp_dev != nullptr) {
-        COM_INF("pp_device = %s (%s)\n", ggml_backend_dev_name(params.pp_dev), ggml_backend_dev_description(params.pp_dev));
-
-        if (params.n_gpu_layers != 0) {
-            COM_WRN("%s", "--pp-dev copies the weights of offloaded layers to the prefill device on every prefill batch\n");
-        }
-    }
+    common_pp_dev_apply_model_params(params, mparams);
 
     if (!params.devices.empty()) {
         mparams.devices = params.devices.data();
     }
 
-    if (params.pp_dev != nullptr && params.pp_dev_resident) {
-        mparams.pp_dev_resident = params.pp_dev;
-    }
 
     mparams.n_gpu_layers    = params.n_gpu_layers;
     mparams.main_gpu        = params.main_gpu;

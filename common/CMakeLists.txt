@@ -99,6 +99,8 @@ add_library(${TARGET}
     ngram-mod.h
     peg-parser.cpp
     peg-parser.h
+    pp-dev.cpp
+    pp-dev.h
     preset.cpp
     preset.h
     reasoning-budget.cpp

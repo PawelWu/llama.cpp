@@ -10,6 +10,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "pp-dev.h"
 #include "preset.h"
 
 // fix problem with std::min and std::max
@@ -1119,7 +1120,7 @@ static void common_params_print_completion(common_params_context & ctx_arg) {
     }
 }
 
-static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & value) {
+std::vector<ggml_backend_dev_t> parse_device_list(const std::string & value) {
     std::vector<ggml_backend_dev_t> devices;
     auto dev_names = string_split<std::string>(value, ',');
     if (dev_names.empty()) {
@@ -2753,30 +2754,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             exit(0);
         }
     ));
-    add_opt(common_arg(
-        {"--pp-dev"}, "DEVICE",
-        "device that should run prefill (e.g. CUDA0)\n"
-        "weight ops of prefill batches (batch size >= 32) run on it,\n"
-        "the weights are copied to this device on every such batch, wherever they are stored\n"
-        "decode (n_tokens = 1) is not affected",
-        [](common_params & params, const std::string & value) {
-            auto devices = parse_device_list(value);
-            // parse_device_list pushes nullptr at back so devices is length 2 for single device.
-            if (devices.size() > 2) {
-                throw std::invalid_argument("only one device may be specified for --pp-dev");
-            }
-            params.pp_dev = devices.front();
-        }
-    ).set_env("LLAMA_ARG_PP_DEV"));
-    add_opt(common_arg(
-        {"--pp-dev-resident"},
-        "keep the weights of the layers that --pp-dev owns in its own VRAM\n"
-        "the layers are the ones the layer split assigns to the pp device (-ts/--tensor-split)\n"
-        "so they are read in place instead of being copied on every prefill batch",
-        [](common_params & params) {
-            params.pp_dev_resident = true;
-        }
-    ).set_env("LLAMA_ARG_PP_DEV_RESIDENT"));
+    for (auto & opt : common_pp_dev_get_args()) {
+        add_opt(std::move(opt));
+    }
     add_opt(common_arg(
         {"-ot", "--override-tensor"}, "<tensor name pattern>=<buffer type>,...",
         "override tensor buffer type", [](common_params & params, const std::string & value) {
