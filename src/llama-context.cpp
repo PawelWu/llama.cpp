@@ -10,6 +10,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "llama-pp-dev.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -583,7 +584,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 
         // the probe checks where the fused op ends up, so it must run with the same offload state
         // as the batches that use it - the probe is decode-sized, so the pp backend stays off
-        sched_set_pp_backend(n_tokens_probe);
+        llama_pp_dev::set_offload_backend(sched.get(), backend_ptrs, cparams.pp_backend, n_tokens_probe);
 
         auto * gf = graph_reserve(n_tokens_probe, n_seqs, n_tokens_probe, mctx, true);
         if (!gf) {
@@ -653,27 +654,6 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 }
 
-// smallest ubatch that is still worth running on the pp backend. the forced offload copies the
-// weights of every offloaded op to the pp backend, which costs the same per ubatch no matter its
-// size, so only prefill-sized batches can pay for it. decode batches (1 token, or a few with
-// speculative decoding) belong on the device that owns the weights
-static constexpr uint32_t PP_BACKEND_MIN_BATCH = 32;
-
-void llama_context::sched_set_pp_backend(uint32_t n_tokens) {
-    if (!cparams.pp_backend) {
-        return;
-    }
-
-    for (auto & backend : backend_ptrs) {
-        if (ggml_backend_get_device(backend) == cparams.pp_backend) {
-            ggml_backend_sched_set_offload_backend(sched.get(), n_tokens >= PP_BACKEND_MIN_BATCH ? backend : nullptr);
-            return;
-        }
-    }
-
-    LLAMA_LOG_WARN("%s: %s is not used by this context, ignoring\n", __func__, ggml_backend_dev_name(cparams.pp_backend));
-}
-
 static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
     std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> users;
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
@@ -733,7 +713,7 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
-    sched_set_pp_backend(n_tokens);
+    llama_pp_dev::set_offload_backend(sched.get(), backend_ptrs, cparams.pp_backend, n_tokens);
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -765,12 +745,8 @@ void llama_context::sched_reserve() {
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
 
     // resolve_fused_ops runs decode-sized probes and leaves the pp backend off, so set it again
-    // GGML_PP_NORESV_FIX=1 keeps the old behavior, to A/B the reserve-time offload state
-    // value-based on purpose: an env var set to an empty string is still "set", and a batch
-    // `set VAR=` that keeps the trailing space is easy to get wrong
-    const char * no_resv_fix = getenv("GGML_PP_NORESV_FIX");
-    if (no_resv_fix == NULL || no_resv_fix[0] != '1') {
-        sched_set_pp_backend(n_tokens);
+    if (llama_pp_dev::rearm_after_reserve()) {
+        llama_pp_dev::set_offload_backend(sched.get(), backend_ptrs, cparams.pp_backend, n_tokens);
     }
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
@@ -783,7 +759,7 @@ void llama_context::sched_reserve() {
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
-                sched_set_pp_backend(n_tokens);
+                llama_pp_dev::set_offload_backend(sched.get(), backend_ptrs, cparams.pp_backend, n_tokens);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -805,7 +781,7 @@ void llama_context::sched_reserve() {
     } else {
         // the tg graph is reserved the way a decode ubatch is computed, so that the assignment and
         // the buffer sizes match what the decode ubatches actually allocate
-        sched_set_pp_backend(n_seqs);
+        llama_pp_dev::set_offload_backend(sched.get(), backend_ptrs, cparams.pp_backend, n_seqs);
 
         auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
@@ -820,7 +796,7 @@ void llama_context::sched_reserve() {
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
-        sched_set_pp_backend(n_tokens);
+        llama_pp_dev::set_offload_backend(sched.get(), backend_ptrs, cparams.pp_backend, n_tokens);
 
         // TODO: the worst case graph is not always reached for `n_seqs > 1`
         //       need to implement a more robust mechanism that tries a few different inputs and analyzes the results
@@ -1543,7 +1519,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         // the pp backend is enabled per ubatch: only prefill-sized batches make up for the weight
         // copies that the forced offload needs
-        sched_set_pp_backend(ubatch.n_tokens);
+        llama_pp_dev::set_offload_backend(sched.get(), backend_ptrs, cparams.pp_backend, ubatch.n_tokens);
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
