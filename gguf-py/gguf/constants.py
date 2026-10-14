@@ -268,6 +268,7 @@ class Keys:
         SCALING_ATTN_FACTOR       = "{arch}.rope.scaling.attn_factor"
         SCALING_ORIG_CTX_LEN      = "{arch}.rope.scaling.original_context_length"
         SCALING_FINETUNED         = "{arch}.rope.scaling.finetuned"
+        SCALING_YARN_TRUNCATE     = "{arch}.rope.scaling.yarn_truncate"
         SCALING_YARN_LOG_MUL      = "{arch}.rope.scaling.yarn_log_multiplier"
         SCALING_YARN_EXT_FACTOR   = "{arch}.rope.scaling.yarn_ext_factor"
         SCALING_YARN_ATTN_FACTOR  = "{arch}.rope.scaling.yarn_attn_factor"
@@ -363,6 +364,7 @@ class Keys:
         CHAT_TEMPLATE_N      = "tokenizer.chat_template.{name}"
         CHAT_TEMPLATES       = "tokenizer.chat_templates"
         # Normalizer constants
+        NORMALIZER_NFC           = "tokenizer.ggml.normalizer.nfc"
         NORMALIZER_LOWERCASE     = "tokenizer.ggml.normalizer.lowercase"
         NORMALIZER_STRIP_ACCENTS = "tokenizer.ggml.normalizer.strip_accents"
         # FIM/Infill special tokens constants
@@ -6137,6 +6139,7 @@ class DecisionType:
     CLEF    = "clef"     # joint head over all questions, one score per option
     PPLX_DECIDER = "pplx-decider"  # same as openjev, label codes of 1 or 2 letters
     VLLM_DECISION2 = "vllm-decision2"  # head over the end token of each option and the last token, one score per option
+    VLLM_D3 = "vllm-d3"  # same as pplx-decider, non-causal attention
     LFM2_D1 = "lfm2-d1"  # same as openjev, the labels depend on the question type
     LFM2_D1_OMNI = "lfm2-d1-omni"  # same head as laya on a bidirectional LFM2 trunk, other prompt layout
 
