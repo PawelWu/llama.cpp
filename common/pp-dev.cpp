@@ -2,8 +2,6 @@
 
 #include "log.h"
 
-#include <algorithm>
-#include <cstdlib>
 #include <stdexcept>
 
 std::vector<common_arg> common_pp_dev_get_args() {
@@ -52,26 +50,4 @@ void common_pp_dev_apply_model_params(const common_params & params, llama_model_
     if (params.pp_dev_resident) {
         mparams.pp_dev_resident = params.pp_dev;
     }
-}
-
-int32_t common_pp_dev_draft_batch_cap(const std::vector<enum common_speculative_type> & types, int32_t n_batch) {
-    const bool has_block_draft = std::any_of(
-        types.begin(), types.end(), [](common_speculative_type t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
-        });
-
-    if (!has_block_draft) {
-        return -1;
-    }
-
-    const char * e = std::getenv("GGML_DRAFT_B");
-    const int32_t cap = e ? std::atoi(e) : 0;
-
-    if (cap <= 0 || n_batch <= cap) {
-        return -1;
-    }
-
-    LOG_INF("%s: clamping draft context n_batch to %d (GGML_DRAFT_B), was %d\n", __func__, (int) cap, (int) n_batch);
-
-    return cap;
 }

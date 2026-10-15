@@ -2668,17 +2668,6 @@ common_speculative_init_result::common_speculative_init_result(
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
 
-    // block-diffusion drafts never decode more than one noise block per pass, and the prompt path is
-    // chunked by this context's own ubatch - so a small n_batch is enough and keeps the flash-attn
-    // working set from OOM'ing on a dGPU that also hosts the target's pp-staging buffers
-    {
-        const int32_t cap = common_pp_dev_draft_batch_cap(params.speculative.types, cparams.n_batch);
-        if (cap > 0) {
-            cparams.n_batch  = cap;
-            cparams.n_ubatch = std::min((int32_t) cparams.n_ubatch, cap);
-        }
-    }
-
     std::string model_path;
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;
